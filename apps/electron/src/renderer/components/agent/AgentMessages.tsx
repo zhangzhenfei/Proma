@@ -2,21 +2,22 @@
  * AgentMessages — Agent 消息列表
  *
  * 复用 Chat 的 Conversation/Message 原语组件，
- * 使用 ToolActivityList 渲染紧凑工具活动列表。
+ * 流式输出通过 SDK 渲染路径（MessageGroupRenderer）展示工具活动。
  */
 
 import * as React from 'react'
-import { useAtomValue } from 'jotai'
-import { Bot, FileText, FileImage, RotateCw, AlertTriangle, ChevronDown, ChevronRight, Plus } from 'lucide-react'
+import { useAtomValue, useSetAtom } from 'jotai'
+import { Bot, FileText, FileImage, RotateCw, AlertTriangle, ChevronDown, ChevronRight, Plus, Minimize2, Download } from 'lucide-react'
+import { ImageLightbox } from '@/components/ui/image-lightbox'
+import { WelcomeEmptyState } from '@/components/welcome/WelcomeEmptyState'
 import {
   Message,
   MessageHeader,
   MessageContent,
   MessageActions,
-  MessageLoading,
   MessageResponse,
-  StreamingIndicator,
   UserMessageContent,
+  BasePathsProvider,
 } from '@/components/ai-elements/message'
 import {
   Conversation,
@@ -25,41 +26,55 @@ import {
 } from '@/components/ai-elements/conversation'
 import { ScrollMinimap } from '@/components/ai-elements/scroll-minimap'
 import type { MinimapItem } from '@/components/ai-elements/scroll-minimap'
+import { StickyUserMessage } from '@/components/ai-elements/sticky-user-message'
 import { useSmoothStream } from '@proma/ui'
 import { UserAvatar } from '@/components/chat/UserAvatar'
 import { CopyButton } from '@/components/chat/CopyButton'
 import { formatMessageTime } from '@/components/chat/ChatMessageItem'
 import { Button } from '@/components/ui/button'
-import { getModelLogo } from '@/lib/model-logo'
+import { getModelLogo, resolveModelDisplayName } from '@/lib/model-logo'
 import { ToolActivityList } from './ToolActivityItem'
-import { BackgroundTasksPanel } from './BackgroundTasksPanel'
-import { useBackgroundTasks } from '@/hooks/useBackgroundTasks'
 import { userProfileAtom } from '@/atoms/user-profile'
+import { tabMinimapCacheAtom } from '@/atoms/tab-atoms'
+import { channelsAtom } from '@/atoms/chat-atoms'
+import { ScrollPositionManager } from '@/hooks/useScrollPositionMemory'
 import { cn } from '@/lib/utils'
-import type { AgentMessage, RetryAttempt } from '@proma/shared'
+import { Spinner } from '@/components/ui/spinner'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
+import { groupIntoTurns, MessageGroupRenderer, getGroupId, getGroupPreview, extractUserText, parseAttachedFiles as sdkParseAttachedFiles, isImageFile as sdkIsImageFile, CompactingIndicator, type MessageGroup } from './SDKMessageRenderer'
+import type { AgentMessage, AgentEventUsage, RetryAttempt, SDKMessage } from '@proma/shared'
 import type { ToolActivity, AgentStreamState } from '@/atoms/agent-atoms'
 
 /** AgentMessages 属性接口 */
 interface AgentMessagesProps {
   sessionId: string
+  /** 用户在前端选择的模型 ID（用于显示渠道配置的 Model Name） */
+  sessionModelId?: string
   messages: AgentMessage[]
+  /** 消息是否已完成首次加载 */
+  messagesLoaded?: boolean
+  /** Phase 4: 持久化的 SDKMessage（新格式） */
+  persistedSDKMessages?: SDKMessage[]
   streaming: boolean
   streamState?: AgentStreamState
+  /** Phase 2: 实时 SDKMessage 列表（流式期间累积） */
+  liveMessages?: SDKMessage[]
+  /** 当前会话工作目录，用于解析相对文件路径 */
+  sessionPath?: string | null
+  /** 附加目录列表（与 sessionPath 一并用作相对路径解析候选） */
+  attachedDirs?: string[]
+  /** 最后一轮是否被用户中断 */
+  stoppedByUser?: boolean
   onRetry?: () => void
   onRetryInNewSession?: () => void
+  onFork?: (upToMessageUuid: string) => void
+  onRewind?: (assistantMessageUuid: string) => void
+  onCompact?: () => void
 }
 
+/** 空状态引导 — 使用 WelcomeEmptyState */
 function EmptyState(): React.ReactElement {
-  return (
-    <div className="flex h-full items-center justify-center">
-      <div className="flex flex-col items-center gap-3 text-muted-foreground">
-        <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center">
-          <Bot size={24} className="text-muted-foreground/60" />
-        </div>
-        <p className="text-sm">在下方输入框开始使用 Agent</p>
-      </div>
-    </div>
-  )
+  return <WelcomeEmptyState />
 }
 
 function AssistantLogo({ model }: { model?: string }): React.ReactElement {
@@ -75,6 +90,71 @@ function AssistantLogo({ model }: { model?: string }): React.ReactElement {
   return (
     <div className="size-[35px] rounded-[25%] bg-primary/10 flex items-center justify-center">
       <Bot size={18} className="text-primary" />
+    </div>
+  )
+}
+
+/** 单张工具结果图片（内联显示），点击可预览大图 */
+function InlineImage({ attachment }: { attachment: { localPath: string; filename: string; mediaType: string } }): React.ReactElement {
+  const [imageSrc, setImageSrc] = React.useState<string | null>(null)
+  const [lightboxOpen, setLightboxOpen] = React.useState(false)
+
+  React.useEffect(() => {
+    window.electronAPI
+      .readAttachment(attachment.localPath)
+      .then((base64) => {
+        setImageSrc(`data:${attachment.mediaType};base64,${base64}`)
+      })
+      .catch((error) => {
+        console.error('[InlineImage] 读取附件失败:', error)
+      })
+  }, [attachment.localPath, attachment.mediaType])
+
+  const handleSave = React.useCallback((): void => {
+    window.electronAPI.saveImageAs(attachment.localPath, attachment.filename)
+  }, [attachment.localPath, attachment.filename])
+
+  if (!imageSrc) {
+    return <div className="size-[280px] rounded-lg bg-muted/30 animate-pulse shrink-0" />
+  }
+
+  return (
+    <div className="relative group inline-block">
+      <img
+        src={imageSrc}
+        alt={attachment.filename}
+        className="size-[280px] rounded-lg object-cover shrink-0 cursor-pointer"
+        onClick={() => setLightboxOpen(true)}
+      />
+      <button
+        type="button"
+        onClick={handleSave}
+        className="absolute bottom-2 right-2 p-1.5 rounded-md bg-black/50 text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-black/70"
+        title="保存图片"
+      >
+        <Download className="size-4" />
+      </button>
+      <ImageLightbox
+        src={imageSrc}
+        alt={attachment.filename}
+        open={lightboxOpen}
+        onOpenChange={setLightboxOpen}
+        onSave={handleSave}
+      />
+    </div>
+  )
+}
+
+/** 从工具活动中提取并内联显示所有生成的图片 */
+function ToolResultInlineImages({ activities }: { activities: ToolActivity[] }): React.ReactElement | null {
+  const allImages = activities.flatMap((a) => a.imageAttachments ?? [])
+  if (allImages.length === 0) return null
+
+  return (
+    <div className="flex flex-wrap gap-2 mb-3">
+      {allImages.map((img, i) => (
+        <InlineImage key={`${img.localPath}-${i}`} attachment={img} />
+      ))}
     </div>
   )
 }
@@ -113,6 +193,7 @@ function extractToolActivities(events: AgentMessage['events']): ToolActivity[] {
           result: event.result,
           isError: event.isError,
           done: true,
+          imageAttachments: event.imageAttachments,
         }
       }
     } else if (event.type === 'task_backgrounded') {
@@ -377,12 +458,16 @@ function RetryAttemptItem({
 /** AgentMessageItem 属性接口 */
 interface AgentMessageItemProps {
   message: AgentMessage
+  sessionPath?: string | null
+  attachedDirs?: string[]
   onRetry?: () => void
   onRetryInNewSession?: () => void
+  onCompact?: () => void
 }
 
-function AgentMessageItem({ message, onRetry, onRetryInNewSession }: AgentMessageItemProps): React.ReactElement | null {
+function AgentMessageItem({ message, sessionPath, attachedDirs, onRetry, onRetryInNewSession, onCompact }: AgentMessageItemProps): React.ReactElement | null {
   const userProfile = useAtomValue(userProfileAtom)
+  const channels = useAtomValue(channelsAtom)
 
   if (message.role === 'user') {
     const { files: attachedFiles, text: messageText } = parseAttachedFiles(message.content)
@@ -424,7 +509,7 @@ function AgentMessageItem({ message, onRetry, onRetryInNewSession }: AgentMessag
     return (
       <Message from="assistant">
         <MessageHeader
-          model={message.model}
+          model={message.model ? resolveModelDisplayName(message.model, channels) : undefined}
           time={formatMessageTime(message.createdAt)}
           logo={<AssistantLogo model={message.model} />}
         />
@@ -434,14 +519,16 @@ function AgentMessageItem({ message, onRetry, onRetryInNewSession }: AgentMessag
               <ToolActivityList activities={toolActivities} />
             </div>
           )}
+          <ToolResultInlineImages activities={toolActivities} />
           {message.content && (
-            <MessageResponse>{message.content}</MessageResponse>
+            <MessageResponse basePath={sessionPath || undefined} basePaths={attachedDirs}>{message.content}</MessageResponse>
           )}
         </MessageContent>
-        {/* 操作按钮（hover 时可见） */}
-        {message.content && (
-          <MessageActions className="pl-[46px] mt-0.5">
-            <CopyButton content={message.content} />
+        {/* 操作栏：左侧靠左排列 */}
+        {(message.durationMs != null || message.content) && (
+          <MessageActions className="pl-[46px] mt-0.5 justify-start gap-2.5">
+            {message.durationMs != null && <DurationBadge durationMs={message.durationMs} usage={message.usage} />}
+            {message.content && <CopyButton content={message.content} />}
           </MessageActions>
         )}
       </Message>
@@ -467,8 +554,14 @@ function AgentMessageItem({ message, onRetry, onRetryInNewSession }: AgentMessag
           </div>
           {/* 错误操作按钮 */}
           <div className="flex items-center gap-2 mt-3">
+            {message.errorCode === 'prompt_too_long' && onCompact && (
+              <Button size="sm" onClick={onCompact}>
+                <Minimize2 className="size-3.5 mr-1.5" />
+                压缩上下文
+              </Button>
+            )}
             {onRetry && (
-              <Button size="sm" onClick={onRetry}>
+              <Button size="sm" variant={message.errorCode === 'prompt_too_long' ? 'outline' : 'default'} onClick={onRetry}>
                 <RotateCw className="size-3.5 mr-1.5" />
                 重试
               </Button>
@@ -492,54 +585,311 @@ function AgentMessageItem({ message, onRetry, onRetryInNewSession }: AgentMessag
   return null
 }
 
-export function AgentMessages({ sessionId, messages, streaming, streamState, onRetry, onRetryInNewSession }: AgentMessagesProps): React.ReactElement {
+/** 格式化耗时（毫秒 → 可读字符串） */
+export function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  const seconds = ms / 1000
+  if (seconds < 60) return `${seconds.toFixed(1)}s`
+  const m = Math.floor(seconds / 60)
+  const s = seconds % 60
+  return `${m}m ${s.toFixed(0)}s`
+}
+
+/** 构建 usage tooltip 多行文本 */
+export function buildUsageTooltip(durationMs: number, usage?: AgentEventUsage): string {
+  const lines: string[] = []
+  lines.push(`耗时: ${formatDuration(durationMs)}`)
+
+  if (usage) {
+    const pureInput = usage.inputTokens - (usage.cacheReadTokens ?? 0) - (usage.cacheCreationTokens ?? 0)
+    if (pureInput > 0) lines.push(`输入: ${pureInput.toLocaleString()}`)
+    if (usage.outputTokens) lines.push(`输出: ${usage.outputTokens.toLocaleString()}`)
+    if (usage.cacheCreationTokens) lines.push(`缓存写入: ${usage.cacheCreationTokens.toLocaleString()}`)
+    if (usage.cacheReadTokens) lines.push(`缓存读取: ${usage.cacheReadTokens.toLocaleString()}`)
+  }
+
+  return lines.join('\n')
+}
+
+/** 耗时徽章 — 悬浮显示 token 用量明细 */
+export function DurationBadge({ durationMs, usage }: { durationMs: number; usage?: AgentEventUsage }): React.ReactElement {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="text-[15px] tabular-nums font-light cursor-default">
+          {formatDuration(durationMs)}
+        </span>
+      </TooltipTrigger>
+      <TooltipContent side="top">
+        <p className="whitespace-pre-line text-left">{buildUsageTooltip(durationMs, usage)}</p>
+      </TooltipContent>
+    </Tooltip>
+  )
+}
+
+/** Agent 运行指示器 — Shimmer Spinner + 无括号的运行时间 */
+function AgentRunningIndicator({ startedAt }: { startedAt?: number }): React.ReactElement {
+  const [elapsed, setElapsed] = React.useState(0)
+
+  React.useEffect(() => {
+    const start = startedAt ?? Date.now()
+    const update = (): void => setElapsed((Date.now() - start) / 1000)
+    update()
+    const timer = setInterval(update, 100)
+    return () => clearInterval(timer)
+  }, [startedAt])
+
+  const formatTime = (seconds: number): string => {
+    if (seconds < 60) return `${seconds.toFixed(1)}s`
+    const m = Math.floor(seconds / 60)
+    const s = seconds % 60
+    return `${m}m ${s.toFixed(1)}s`
+  }
+
+  return (
+    <div className="flex items-center gap-2 min-h-[28px]">
+      <Spinner size="sm" className="text-primary/75" />
+      <span className="text-[13px] font-light text-muted-foreground/75 tabular-nums">Agent Running {formatTime(elapsed)}</span>
+    </div>
+  )
+}
+
+export function AgentMessages({ sessionId, sessionModelId, messages, messagesLoaded, persistedSDKMessages, streaming, streamState, liveMessages, sessionPath, attachedDirs, stoppedByUser, onRetry, onRetryInNewSession, onFork, onRewind, onCompact }: AgentMessagesProps): React.ReactElement {
   const userProfile = useAtomValue(userProfileAtom)
+  const setMinimapCache = useSetAtom(tabMinimapCacheAtom)
+  const channels = useAtomValue(channelsAtom)
+  /** 淡入控制：切换会话时先隐藏，等布局完成后再显示。 */
+  const [ready, setReady] = React.useState(false)
+  const prevSessionIdRef = React.useRef<string | null>(null)
+
+  React.useEffect(() => {
+    if (sessionId !== prevSessionIdRef.current) {
+      prevSessionIdRef.current = sessionId
+      setReady(false)
+    }
+  }, [sessionId])
+
+  React.useEffect(() => {
+    if (ready) return
+
+    // 必须等消息加载完成，否则 messages=[] 会被误判为空对话
+    if (messagesLoaded === false) return
+
+    // 流式进行中且有实时内容 → 跳过 fade 直接显示
+    if (streaming && liveMessages && liveMessages.length > 0) {
+      setReady(true)
+      return
+    }
+
+    if (messages.length === 0 && (!persistedSDKMessages || persistedSDKMessages.length === 0) && !streaming) {
+      setReady(true)
+      return
+    }
+    let cancelled = false
+    requestAnimationFrame(() => {
+      if (!cancelled) setReady(true)
+    })
+    return () => { cancelled = true }
+  }, [messages, streaming, liveMessages, persistedSDKMessages, messagesLoaded])
 
   // 从 streamState 属性中计算派生值
   const streamingContent = streamState?.content ?? ''
-  const toolActivities = streamState?.toolActivities ?? []
-  const agentStreamingModel = streamState?.model
+  const agentStreamingModel = streamState?.model ? resolveModelDisplayName(streamState.model, channels) : undefined
   const retrying = streamState?.retrying
   const startedAt = streamState?.startedAt
-
-  // 获取后台任务列表
-  const { tasks: backgroundTasks } = useBackgroundTasks(sessionId)
 
   const { displayedContent: smoothContent } = useSmoothStream({
     content: streamingContent,
     isStreaming: streaming,
   })
 
-  // 迷你地图数据
+  /**
+   * 流式完成过渡：streaming 结束到持久化消息加载完成之间，
+   * 强制 resize="instant" 避免中间高度变化触发平滑滚动动画。
+   */
+  const [transitioning, setTransitioning] = React.useState(false)
+  React.useEffect(() => {
+    if (streaming) {
+      setTransitioning(false)
+      return
+    }
+    if (streamingContent || smoothContent) {
+      setTransitioning(true)
+      return
+    }
+    const timer = setTimeout(() => setTransitioning(false), 150)
+    return () => clearTimeout(timer)
+  }, [streaming, streamingContent, smoothContent])
+
+  // 判断是否使用新的 SDKMessage 渲染路径
+  const useSDKRenderer = persistedSDKMessages && persistedSDKMessages.length > 0
+  const hasContent = useSDKRenderer ? persistedSDKMessages.length > 0 : messages.length > 0
+
+  // 合并持久化 + 实时 SDKMessage（供 ContentBlock 内查找工具结果）
+  const allSDKMessages = React.useMemo(() => {
+    const persisted = persistedSDKMessages ?? []
+    const live = liveMessages ?? []
+    const liveSet = new Set(live)
+    return [...persisted.filter(m => !liveSet.has(m)), ...live]
+  }, [persistedSDKMessages, liveMessages])
+
+  // 压缩流程进行中（含收尾窗口：compact_boundary 已到但 result 未到）
+  // → 一律抑制 AgentRunningIndicator，避免压缩分隔符切换期间闪烁。
+  // compactInFlight 从点击压缩 / SDK compacting 事件开始为 true，
+  // 直到整个 stream 结束（stream state 被删除）才消失。
+  const suppressAgentRunning = streamState?.isCompacting || streamState?.compactInFlight
+
+  // 统一分组：将持久化 + 实时消息合并后再分组，确保 system 消息（如压缩分割线）出现在正确位置
+  const allGroups = React.useMemo(() => {
+    if (!useSDKRenderer) return []
+    return groupIntoTurns(allSDKMessages, sessionModelId)
+  }, [useSDKRenderer, allSDKMessages, sessionModelId])
+
+  // 标记哪些 group 属于实时流式消息（用于 isStreaming / onFork 差异化渲染）
+  const liveGroupSet = React.useMemo(() => {
+    if (!liveMessages || liveMessages.length === 0) return new Set<MessageGroup>()
+    const liveSet = new Set<SDKMessage>(liveMessages)
+    const result = new Set<MessageGroup>()
+    for (const group of allGroups) {
+      let isLive = false
+      if (group.type === 'user' || group.type === 'system') {
+        isLive = liveSet.has(group.message as SDKMessage)
+      } else {
+        // assistant-turn 可能被 mergeAdjacentSameModelTurns 合并，
+        // 需检查任意一条 assistantMessage 是否来自实时流
+        isLive = group.assistantMessages.some((m) => liveSet.has(m as SDKMessage))
+      }
+      if (isLive) result.add(group)
+    }
+    return result
+  }, [allGroups, liveMessages])
+
+  // 迷你地图数据 — 直接使用统一的 allGroups（无需去重）
   const minimapItems: MinimapItem[] = React.useMemo(
-    () => messages.map((m) => ({
-      id: m.id,
-      role: m.role === 'status' ? 'status' as const : m.role as MinimapItem['role'],
-      preview: m.content.replace(/<attached_files>[\s\S]*?<\/attached_files>\n*/, '').slice(0, 80),
-      avatar: m.role === 'user' ? userProfile.avatar : undefined,
-      model: m.model,
-    })),
-    [messages, userProfile.avatar]
+    () => {
+      if (useSDKRenderer) {
+        return allGroups.map((group) => ({
+          id: getGroupId(group),
+          role: group.type === 'user' ? 'user' as const
+            : group.type === 'system' ? 'status' as const
+            : 'assistant' as const,
+          preview: getGroupPreview(group),
+          avatar: group.type === 'user' ? userProfile.avatar : undefined,
+          model: group.type === 'assistant-turn' ? group.model : undefined,
+        }))
+      }
+      // 旧格式回退
+      return messages.map((m, i) => ({
+        id: m.id || `msg-${i}`,
+        role: m.role === 'status' ? 'status' as const : m.role as MinimapItem['role'],
+        preview: (m.content ?? '').replace(/<attached_files>[\s\S]*?<\/attached_files>\n*/, '').slice(0, 200),
+        avatar: m.role === 'user' ? userProfile.avatar : undefined,
+        model: m.model,
+      }))
+    },
+    [useSDKRenderer, allGroups, messages, userProfile.avatar]
   )
 
+  // 同步 minimap 缓存到 Tab 级别（供 Tab hover 预览使用）
+  React.useEffect(() => {
+    if (minimapItems.length > 0) {
+      setMinimapCache((prev) => {
+        const next = new Map(prev)
+        next.set(sessionId, minimapItems)
+        return next
+      })
+    }
+  }, [sessionId, minimapItems, setMinimapCache])
+
+  // 所有用户消息的数据 — 供 StickyUserMessage 使用
+  const allUserMessagesData = React.useMemo(() => {
+    if (useSDKRenderer) {
+      return allGroups
+        .filter((g): g is MessageGroup & { type: 'user' } => g.type === 'user')
+        .map((g) => {
+          const rawText = extractUserText(g.message) ?? ''
+          const { files, text } = sdkParseAttachedFiles(rawText)
+          return {
+            id: getGroupId(g),
+            text,
+            attachments: files.map((f) => ({ filename: f.filename, isImage: sdkIsImageFile(f.filename) })),
+          }
+        })
+    }
+    // 旧格式回退
+    return messages
+      .filter((m) => m.role === 'user')
+      .map((m) => {
+        const { files, text } = parseAttachedFiles(m.content ?? '')
+        return {
+          id: m.id ?? null,
+          text,
+          attachments: files.map((f) => ({ filename: f.filename, isImage: isImageFile(f.filename) })),
+        }
+      })
+  }, [useSDKRenderer, allGroups, messages])
+
+  // 实时消息中是否已有可渲染的助手内容
+  const hasLiveAssistantContent = allGroups.some((g) => g.type === 'assistant-turn' && liveGroupSet.has(g))
+
   return (
-    <Conversation>
+    <BasePathsProvider basePaths={attachedDirs}>
+    <Conversation resize={ready && !transitioning ? 'smooth' : 'instant'} className={ready ? 'opacity-100 transition-opacity duration-200' : 'opacity-0'}>
+      <ScrollPositionManager id={sessionId} ready={ready} />
       <ConversationContent>
-        {messages.length === 0 && !streaming ? (
+        {!hasContent && !streaming ? (
           <EmptyState />
         ) : (
           <>
-            {messages.map((msg: AgentMessage) => (
-              <div key={msg.id} data-message-id={msg.id}>
-                <AgentMessageItem
-                  message={msg}
-                  onRetry={onRetry}
-                  onRetryInNewSession={onRetryInNewSession}
-                />
-              </div>
-            ))}
+            {/* 统一消息渲染（持久化 + 实时合并为一个列表，确保 system 消息位置正确） */}
+            {useSDKRenderer ? (
+              allGroups.map((group, idx) => {
+                const isLive = liveGroupSet.has(group)
+                // 仅在最后一个 assistant-turn 上显示"已被用户中断" badge
+                const isLastAssistantTurn = !streaming && stoppedByUser
+                  && group.type === 'assistant-turn'
+                  && idx === allGroups.findLastIndex((g) => g.type === 'assistant-turn')
+                return (
+                  <MessageGroupRenderer
+                    key={getGroupId(group)}
+                    group={group}
+                    allMessages={allSDKMessages}
+                    basePath={sessionPath || undefined}
+                    onFork={isLive ? undefined : onFork}
+                    onRewind={isLive ? undefined : onRewind}
+                    isStreaming={isLive || undefined}
+                    stoppedByUser={isLastAssistantTurn || undefined}
+                    sessionModelId={sessionModelId}
+                  />
+                )
+              })
+            ) : (
+              // 旧格式回退 — AgentMessageItem
+              messages.map((msg: AgentMessage) => (
+                <div key={msg.id} data-message-id={msg.id} data-message-role={msg.role === 'user' ? 'user' : undefined}>
+                  <AgentMessageItem
+                    message={msg}
+                    sessionPath={sessionPath}
+                    attachedDirs={attachedDirs}
+                    onRetry={onRetry}
+                    onRetryInNewSession={onRetryInNewSession}
+                    onCompact={onCompact}
+                  />
+                </div>
+              ))
+            )}
 
-            {(streaming || smoothContent || toolActivities.length > 0 || retrying) && (
+            {/* 有实时助手内容时：显示运行指示器或占位（防止 streaming 结束到 Actions Bar 出现之间的高度跳动） */}
+            {hasLiveAssistantContent && !suppressAgentRunning && (
+              <div className="pl-[56px] mt-0.5 min-h-[28px]">
+                {retrying && <RetryingNotice retrying={retrying} />}
+                {streaming && <AgentRunningIndicator startedAt={startedAt} />}
+              </div>
+            )}
+
+            {/* 无实时助手内容时：显示完整气泡（含头像/名称/时间） */}
+            {/* 注意：工具活动已通过 SDK 渲染路径（liveGroups）展示，此处不再使用 ToolActivityList */}
+            {!hasLiveAssistantContent && !suppressAgentRunning && (streaming || smoothContent || retrying) && (
               <Message from="assistant">
                 <MessageHeader
                   model={agentStreamingModel}
@@ -548,29 +898,31 @@ export function AgentMessages({ sessionId, messages, streaming, streamState, onR
                 />
                 <MessageContent>
                   {retrying && <RetryingNotice retrying={retrying} />}
-                  {toolActivities.length > 0 && (
-                    <div className="mb-3">
-                      <ToolActivityList activities={toolActivities} animate />
-                      {/* 后台任务面板 — 显示在工具活动下方 */}
-                      <BackgroundTasksPanel tasks={backgroundTasks} />
-                    </div>
-                  )}
                   {smoothContent ? (
                     <>
-                      <MessageResponse>{smoothContent}</MessageResponse>
-                      {streaming && <StreamingIndicator />}
+                      <MessageResponse basePath={sessionPath || undefined} basePaths={attachedDirs}>{smoothContent}</MessageResponse>
+                      {streaming && <AgentRunningIndicator startedAt={startedAt} />}
                     </>
                   ) : (
-                    streaming && toolActivities.length === 0 && !retrying && <MessageLoading startedAt={startedAt} />
+                    streaming && <AgentRunningIndicator startedAt={startedAt} />
                   )}
                 </MessageContent>
               </Message>
             )}
+
+            {/* 压缩中指示器：由 isCompacting flag 驱动的尾部元素，compact_boundary 到达时 flag 翻 false 自然消失，
+                视觉上被流中新出现的"上下文已压缩"分隔符无缝替换 */}
+            {streamState?.isCompacting && <CompactingIndicator />}
+
           </>
         )}
       </ConversationContent>
       <ScrollMinimap items={minimapItems} />
       <ConversationScrollButton />
+      {allUserMessagesData.length > 0 && (
+        <StickyUserMessage userMessages={allUserMessagesData} />
+      )}
     </Conversation>
+    </BasePathsProvider>
   )
 }

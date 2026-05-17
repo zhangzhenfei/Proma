@@ -6,10 +6,10 @@
  */
 
 import * as React from 'react'
-import { useAtom } from 'jotai'
-import { Send } from 'lucide-react'
+import { useAtom, useSetAtom } from 'jotai'
+import { Send, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { allPendingAskUserRequestsAtom } from '@/atoms/agent-atoms'
+import { allPendingAskUserRequestsAtom, agentStreamingStatesAtom, finalizeStreamingActivities } from '@/atoms/agent-atoms'
 import type { AskUserQuestion } from '@proma/shared'
 
 interface QuestionAnswer {
@@ -27,20 +27,41 @@ interface AskUserBannerProps {
 
 export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactElement | null {
   const [allRequests, setAllRequests] = useAtom(allPendingAskUserRequestsAtom)
+  const setStreamingStates = useSetAtom(agentStreamingStatesAtom)
   const requests = allRequests.get(sessionId) ?? []
   const [answers, setAnswers] = React.useState<Map<number, QuestionAnswer>>(new Map())
   const [submitting, setSubmitting] = React.useState(false)
   const [activeTab, setActiveTab] = React.useState(0)
-  const [focusedOptIdx, setFocusedOptIdx] = React.useState(0)
-  const submitRef = React.useRef<(() => void) | null>(null)
+  const [focusedOptIdx, setFocusedOptIdx] = React.useState(-1)
 
   const request = requests[0] ?? null
   const questions = request?.questions ?? []
   const isLastTab = activeTab >= questions.length - 1
 
+  // ===== Refs：确保 keydown handler 始终读取最新值，消除闭包过期问题 =====
+  const activeTabRef = React.useRef(activeTab)
+  activeTabRef.current = activeTab
+  const questionsRef = React.useRef(questions)
+  questionsRef.current = questions
+  const focusedOptIdxRef = React.useRef(focusedOptIdx)
+  focusedOptIdxRef.current = focusedOptIdx
+  const submitRef = React.useRef<(() => void) | null>(null)
+  const autoAdvanceTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const clearAutoAdvanceTimer = React.useCallback((): void => {
+    if (autoAdvanceTimerRef.current != null) {
+      clearTimeout(autoAdvanceTimerRef.current)
+      autoAdvanceTimerRef.current = null
+    }
+  }, [])
+
+  // 组件卸载时清理未触发的跳转定时器
+  React.useEffect(() => clearAutoAdvanceTimer, [clearAutoAdvanceTimer])
+
   React.useEffect(() => {
+    clearAutoAdvanceTimer()
     setActiveTab(0)
-    setFocusedOptIdx(0)
+    setFocusedOptIdx(-1)
     const firstOpt = questions[0]?.options[0]
     setAnswers(firstOpt
       ? new Map([[0, { ...EMPTY_ANSWER, selected: [firstOpt.label] }]])
@@ -49,7 +70,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
 
   // 切换 Tab 时重置焦点并默认选中第一个选项
   React.useEffect(() => {
-    setFocusedOptIdx(0)
+    setFocusedOptIdx(-1)
     setAnswers((prev) => {
       if (prev.has(activeTab)) return prev
       const firstOpt = questions[activeTab]?.options[0]
@@ -60,51 +81,78 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
     })
   }, [activeTab])
 
-  const goNextTab = React.useCallback(() => {
-    if (!isLastTab) setActiveTab((prev) => prev + 1)
-  }, [isLastTab])
-
-  // 键盘导航
+  // 键盘导航：只在 requestId 变化时重建 handler，内部通过 ref 读取最新值
   React.useEffect(() => {
     if (!request || questions.length === 0) return
-    const q = questions[activeTab]
-    if (!q) return
-    const itemCount = q.options.length + 1
 
     const handleKeyDown = (e: KeyboardEvent): void => {
-      // 自由文本输入框内：仅 Enter 生效
+      const curTab = activeTabRef.current
+      const qs = questionsRef.current
+      const curFocusIdx = focusedOptIdxRef.current
+      const q = qs[curTab]
+      if (!q) return
+      const itemCount = q.options.length + 1
+      const lastTab = curTab >= qs.length - 1
+
+      // 自由文本输入框内：仅 Enter 生效（输入法组合中跳过）
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
-        if (e.key === 'Enter' && !e.shiftKey) {
+        if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
           e.preventDefault()
-          if (isLastTab) submitRef.current?.()
-          else goNextTab()
+          if (lastTab) submitRef.current?.()
+          else setActiveTab((prev) => prev + 1)
         }
         return
       }
 
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault()
-        const nextIdx = e.key === 'ArrowDown'
-          ? (focusedOptIdx + 1) % itemCount
-          : (focusedOptIdx - 1 + itemCount) % itemCount
+        const nextIdx = curFocusIdx === -1
+          ? (e.key === 'ArrowDown' ? 0 : itemCount - 1)
+          : e.key === 'ArrowDown'
+            ? (curFocusIdx + 1) % itemCount
+            : (curFocusIdx - 1 + itemCount) % itemCount
         setFocusedOptIdx(nextIdx)
         // 移动焦点同时选中
         if (nextIdx < q.options.length) {
           const opt = q.options[nextIdx]
-          if (opt) toggleOptionByState(activeTab, q, opt.label)
+          if (opt) toggleOptionByState(curTab, q, opt.label)
         } else {
-          toggleCustomByState(activeTab)
+          toggleCustomByState(curTab)
         }
-      } else if (e.key === 'Enter') {
+      } else if (e.key === 'Enter' && !e.isComposing) {
         e.preventDefault()
-        if (isLastTab) submitRef.current?.()
-        else goNextTab()
+        if (lastTab) submitRef.current?.()
+        else setActiveTab((prev) => prev + 1)
       }
     }
 
     document.addEventListener('keydown', handleKeyDown)
     return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [request?.requestId, questions.length, activeTab, focusedOptIdx, isLastTab, goNextTab])
+  }, [request?.requestId])
+
+  /** 关闭问题 & 终止 Agent */
+  const handleDismiss = (): void => {
+    // 立即标记 streaming 停止，避免 UI 残留
+    setStreamingStates((prev) => {
+      const current = prev.get(sessionId)
+      if (!current || !current.running) return prev
+      const map = new Map(prev)
+      map.set(sessionId, {
+        ...current,
+        running: false,
+        ...finalizeStreamingActivities(current.toolActivities, current.teammates),
+      })
+      return map
+    })
+    // 清除当前 session 所有待处理的 AskUser 请求
+    setAllRequests((prev) => {
+      const map = new Map(prev)
+      map.delete(sessionId)
+      return map
+    })
+    // 终止 Agent
+    window.electronAPI.stopAgent(sessionId).catch(console.error)
+  }
 
   if (!request) return null
 
@@ -170,15 +218,29 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
   const currentQuestion = questions[activeTab]
   if (!currentQuestion) return null
 
+  const goNextTab = (): void => {
+    if (!isLastTab) setActiveTab((prev) => prev + 1)
+  }
+
   return (
     <div className="mx-4 mb-3 rounded-xl bg-card shadow-lg overflow-hidden animate-in slide-in-from-bottom-2 duration-200">
       {/* 头部 + Tab 栏 */}
       <div className="px-4 pt-3 pb-2">
         <div className="flex items-center justify-between mb-2">
           <span className="text-sm font-medium text-foreground">Proma Agent 需要你的输入</span>
-          {requests.length > 1 && (
-            <span className="text-xs text-muted-foreground">(+{requests.length - 1})</span>
-          )}
+          <div className="flex items-center gap-1.5">
+            {requests.length > 1 && (
+              <span className="text-xs text-muted-foreground">(+{requests.length - 1})</span>
+            )}
+            <button
+              type="button"
+              className="size-5 flex items-center justify-center rounded-md text-muted-foreground/50 hover:text-foreground hover:bg-muted/60 transition-colors"
+              onClick={handleDismiss}
+              title="关闭并终止 Agent"
+            >
+              <X className="size-3.5" />
+            </button>
+          </div>
         </div>
 
         {/* Tab 栏（多问题时显示） */}
@@ -203,7 +265,7 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
                   `}
                   onClick={() => setActiveTab(idx)}
                 >
-                  {q.header || `问题 ${idx + 1}`}
+                  {`${idx + 1}-${q.multiSelect ? '多选' : '单选'}：${q.header || `问题 ${idx + 1}`}`}
                 </button>
               )
             })}
@@ -215,10 +277,20 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
       <div className="px-4 pb-2">
         <QuestionCard
           question={currentQuestion}
+          questionIndex={activeTab}
           answer={getAnswer(activeTab)}
           focusedIndex={focusedOptIdx}
-          showHeader={questions.length === 1}
-          onToggleOption={(label) => toggleOptionByState(activeTab, currentQuestion, label)}
+          showBadge={questions.length === 1}
+          onToggleOption={(label) => {
+            toggleOptionByState(activeTab, currentQuestion, label)
+            if (!currentQuestion.multiSelect && !isLastTab) {
+              clearAutoAdvanceTimer()
+              autoAdvanceTimerRef.current = setTimeout(() => {
+                autoAdvanceTimerRef.current = null
+                setActiveTab((prev) => prev + 1)
+              }, 150)
+            }
+          }}
           onToggleCustom={() => toggleCustomByState(activeTab)}
           onCustomTextChange={(text) => setAnswers((prev) => {
             const map = new Map(prev)
@@ -255,18 +327,20 @@ export function AskUserBanner({ sessionId }: AskUserBannerProps): React.ReactEle
 /** 单个问题卡片（竖向选项） */
 function QuestionCard({
   question,
+  questionIndex,
   answer,
   focusedIndex,
-  showHeader,
+  showBadge,
   onToggleOption,
   onToggleCustom,
   onCustomTextChange,
   onSubmit,
 }: {
   question: AskUserQuestion
+  questionIndex: number
   answer: QuestionAnswer
   focusedIndex: number
-  showHeader: boolean
+  showBadge: boolean
   onToggleOption: (label: string) => void
   onToggleCustom: () => void
   onCustomTextChange: (text: string) => void
@@ -276,11 +350,11 @@ function QuestionCard({
 
   return (
     <div className="space-y-2">
-      {/* 问题文本 */}
-      <div className="flex items-center gap-2">
-        {showHeader && question.header && (
-          <span className="shrink-0 inline-flex items-center px-2 py-0.5 rounded-full text-[11px] font-medium bg-primary/10 text-primary">
-            {question.header}
+      {/* 问题标签 + 文本（分行显示） */}
+      <div className="space-y-1">
+        {showBadge && (
+          <span className="shrink-0 inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-medium bg-primary text-primary-foreground shadow-sm">
+            {`${questionIndex + 1}-${question.multiSelect ? '多选' : '单选'}${question.header ? `：${question.header}` : ''}`}
           </span>
         )}
         <p className="text-sm text-foreground">{question.question}</p>
@@ -347,8 +421,9 @@ function QuestionCard({
           value={answer.customText}
           onChange={(e) => onCustomTextChange(e.target.value)}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault()
+              e.stopPropagation() // 阻止冒泡到 document handler，避免重复触发 setActiveTab
               onSubmit()
             }
           }}

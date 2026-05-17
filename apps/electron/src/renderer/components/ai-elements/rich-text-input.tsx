@@ -5,7 +5,7 @@
  *
  * 功能：
  * - StarterKit + Placeholder + Underline + Link + CodeBlockLowlight
- * - 可选 Mention 扩展（@ 引用文件）
+ * - 可选 Mention 扩展（@ 引用文件、/ 触发 Skill、# 触发 MCP）
  * - htmlToMarkdown 转换
  * - IME composition 处理
  * - Enter 提交 / Shift+Enter 换行
@@ -26,6 +26,7 @@ import { ChevronsDownUp, ChevronsUpDown } from 'lucide-react'
 import { Tooltip, TooltipTrigger, TooltipContent } from '@/components/ui/tooltip'
 import { cn } from '@/lib/utils'
 import { createFileMentionSuggestion } from '@/components/file-browser/file-mention-suggestion'
+import { createSkillMentionSuggestion, createMcpMentionSuggestion } from '@/components/agent/mention-suggestions'
 
 // 创建 lowlight 实例，使用常见语言
 const lowlight = createLowlight(common)
@@ -54,7 +55,7 @@ function htmlToMarkdown(html: string): string {
 
     switch (tagName) {
       case 'p':
-        return children + '\n\n'
+        return children + '\n'
       case 'br':
         return '\n'
       case 'strong':
@@ -82,7 +83,7 @@ function htmlToMarkdown(html: string): string {
         const langMatch = langClass.match(/language-(\w+)/)
         const lang = langMatch ? langMatch[1] : ''
         const codeContent = codeEl ? processNode(codeEl) : children
-        return `\`\`\`${lang}\n${codeContent}\n\`\`\`\n\n`
+        return `\`\`\`${lang}\n${codeContent}\n\`\`\`\n`
       }
       case 'a': {
         const href = el.getAttribute('href') || ''
@@ -91,30 +92,34 @@ function htmlToMarkdown(html: string): string {
       case 'ul':
         return Array.from(el.children)
           .map((li) => `- ${processNode(li).trim()}`)
-          .join('\n') + '\n\n'
+          .join('\n') + '\n'
       case 'ol':
         return Array.from(el.children)
           .map((li, i) => `${i + 1}. ${processNode(li).trim()}`)
-          .join('\n') + '\n\n'
+          .join('\n') + '\n'
       case 'li':
         return children
       case 'blockquote':
         return children
           .split('\n')
           .map((line) => `> ${line}`)
-          .join('\n') + '\n\n'
-      case 'h1': return `# ${children}\n\n`
-      case 'h2': return `## ${children}\n\n`
-      case 'h3': return `### ${children}\n\n`
-      case 'h4': return `#### ${children}\n\n`
-      case 'h5': return `##### ${children}\n\n`
-      case 'h6': return `###### ${children}\n\n`
-      case 'hr': return '---\n\n'
+          .join('\n') + '\n'
+      case 'h1': return `# ${children}\n`
+      case 'h2': return `## ${children}\n`
+      case 'h3': return `### ${children}\n`
+      case 'h4': return `#### ${children}\n`
+      case 'h5': return `##### ${children}\n`
+      case 'h6': return `###### ${children}\n`
+      case 'hr': return '---\n'
       case 'span': {
-        // Mention 节点：转换为 @file:路径 格式
-        if (el.getAttribute('data-type') === 'mention') {
-          const filePath = el.getAttribute('data-id') || ''
-          return `@file:${filePath}`
+        // Mention 节点：根据 data-mention-suggestion-char 区分类型
+        const dataType = el.getAttribute('data-type')
+        const dataId = el.getAttribute('data-id') || ''
+        const suggestionChar = el.getAttribute('data-mention-suggestion-char') || '@'
+        if (dataType === 'mention') {
+          if (suggestionChar === '/') return `/skill:${dataId}`
+          if (suggestionChar === '#') return `#mcp:${dataId}`
+          return `@file:${dataId}`
         }
         return children
       }
@@ -181,8 +186,16 @@ interface RichTextInputProps {
   collapsible?: boolean
   /** 工作区根路径（启用 @ 引用文件功能时需要） */
   workspacePath?: string | null
+  /** 工作区 slug（启用 / Skill 和 # MCP 功能时需要） */
+  workspaceSlug?: string | null
   /** 附加目录路径列表（@ 引用时一并搜索） */
   attachedDirs?: string[]
+  /** HTML 草稿值（切换会话恢复时使用，保留 mention 等富文本结构） */
+  htmlValue?: string
+  /** HTML 值变更回调（用于保存富文本草稿） */
+  onHtmlChange?: (html: string) => void
+  /** 是否使用 Cmd/Ctrl+Enter 发送（而非 Enter） */
+  sendWithCmdEnter?: boolean
   className?: string
 }
 
@@ -204,7 +217,11 @@ export function RichTextInput({
   autoFocusTrigger,
   collapsible = false,
   workspacePath,
+  workspaceSlug,
   attachedDirs = [],
+  htmlValue,
+  onHtmlChange,
+  sendWithCmdEnter = false,
 }: RichTextInputProps): React.ReactElement {
   const [isExpanded, setIsExpanded] = useState(false)
   // 手动折叠状态：用户主动折叠输入框
@@ -219,18 +236,44 @@ export function RichTextInput({
   // 保持 onPasteFiles 引用最新
   const onPasteFilesRef = useRef(onPasteFiles)
   onPasteFilesRef.current = onPasteFiles
+  // 保持 onHtmlChange 引用最新
+  const onHtmlChangeRef = useRef(onHtmlChange)
+  onHtmlChangeRef.current = onHtmlChange
+  // 发送模式引用
+  const sendWithCmdEnterRef = useRef(sendWithCmdEnter)
+  sendWithCmdEnterRef.current = sendWithCmdEnter
   // Mention 活跃状态（阻止 Enter 发送消息）
   const mentionActiveRef = useRef(false)
+  // Mention 弹窗中的可选项数量（0 时 Enter 不阻塞发送）
+  const mentionItemCountRef = useRef(0)
   // 工作区路径引用（给 Suggestion 使用）
   const workspacePathRef = useRef<string | null>(workspacePath ?? null)
   workspacePathRef.current = workspacePath ?? null
   // 附加目录路径引用（给 Suggestion 使用）
   const attachedDirsRef = useRef<string[]>(attachedDirs)
   attachedDirsRef.current = attachedDirs
+  // 工作区 slug 引用（给 Skill/MCP Suggestion 使用）
+  const workspaceSlugRef = useRef<string | null>(workspaceSlug ?? null)
+  workspaceSlugRef.current = workspaceSlug ?? null
+
+  // 是否启用 Mention 功能（需要工作区路径或 slug）
+  const hasMentionSupport = !!(workspacePath || workspaceSlug)
 
   // Mention Suggestion 配置（稳定引用，不随 workspacePath 变化重建）
   const mentionSuggestion = useMemo(
-    () => createFileMentionSuggestion(workspacePathRef, mentionActiveRef, attachedDirsRef),
+    () => createFileMentionSuggestion(workspacePathRef, mentionActiveRef, attachedDirsRef, mentionItemCountRef),
+    [],
+  )
+
+  // Skill Suggestion 配置（/ 触发）
+  const skillSuggestion = useMemo(
+    () => createSkillMentionSuggestion(workspaceSlugRef, mentionActiveRef, mentionItemCountRef),
+    [],
+  )
+
+  // MCP Suggestion 配置（# 触发）
+  const mcpSuggestion = useMemo(
+    () => createMcpMentionSuggestion(workspaceSlugRef, mentionActiveRef, mentionItemCountRef),
     [],
   )
 
@@ -253,21 +296,56 @@ export function RichTextInput({
       CodeBlockLowlight.configure({
         lowlight,
         HTMLAttributes: {
-          class: 'rounded-md bg-muted p-3 font-mono text-sm',
+          class: 'rounded-md p-3 font-mono text-sm',
         },
       }),
       Placeholder.configure({
         placeholder,
         emptyEditorClass: 'is-editor-empty',
       }),
-      // @ 引用文件（始终加载扩展，workspacePathRef 内部控制是否搜索）
-      // 不能条件加载，因为 useEditor 不会在 workspacePath 变化时重建扩展
-      Mention.configure({
-        HTMLAttributes: {
-          class: 'mention-chip',
-        },
-        suggestion: mentionSuggestion,
-      }),
+      // Mention 扩展：仅在 Agent 模式（有工作区）时启用
+      // @ 引用文件、/ 触发 Skill、# 触发 MCP
+      ...(hasMentionSupport ? [
+        Mention.extend({
+          addAttributes() {
+            return {
+              ...this.parent?.(),
+              mentionSuggestionChar: {
+                default: '@',
+                parseHTML: (el: HTMLElement) => el.getAttribute('data-mention-suggestion-char') || '@',
+                renderHTML: (attrs: Record<string, string>) => ({
+                  'data-mention-suggestion-char': attrs.mentionSuggestionChar,
+                }),
+              },
+            }
+          },
+        }).configure({
+          HTMLAttributes: {},
+          renderHTML({ node, suggestion }) {
+            const char = suggestion?.char ?? node.attrs.mentionSuggestionChar ?? '@'
+            const label = node.attrs.label ?? node.attrs.id
+            let chipClass = 'mention-chip'
+            if (char === '/') chipClass = 'skill-mention-chip'
+            else if (char === '#') chipClass = 'mcp-mention-chip'
+            return [
+              'span',
+              {
+                'data-type': 'mention',
+                'data-id': node.attrs.id,
+                'data-label': node.attrs.label,
+                'data-mention-suggestion-char': char,
+                class: chipClass,
+              },
+              `${char === '@' ? '@' : ''}${label}`,
+            ]
+          },
+          suggestions: [
+            mentionSuggestion,
+            skillSuggestion,
+            mcpSuggestion,
+          ],
+        }),
+      ] : []),
     ],
     content: value || '',
     editable: !disabled,
@@ -275,10 +353,10 @@ export function RichTextInput({
       attributes: {
         class: cn(
           'prose dark:prose-invert max-w-none focus:outline-none',
-          'min-h-[60px] w-full text-[14px] leading-[1.6]',
+          'min-h-[101px] w-full text-[15px] leading-[1.6]',
           '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
-          '[&_pre]:bg-muted [&_pre]:rounded-md [&_pre]:p-3',
-          '[&_code]:bg-muted [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-sm',
+          '[&_pre]:rounded-md [&_pre]:p-3',
+          '[&_code]:bg-muted [&_code]:rounded [&_code]:px-1 [&_code]:py-0.5 [&_code]:text-sm [&_code]:text-foreground',
           '[&_pre_code]:bg-transparent [&_pre_code]:p-0'
         ),
       },
@@ -292,6 +370,20 @@ export function RichTextInput({
           isComposingRef.current = false
           return false
         },
+        copy: (_view, event) => {
+          // 复制时只写纯文本，避免粘贴到外部应用时出现多余空行
+          const selection = window.getSelection()
+          if (!selection || selection.isCollapsed || !event.clipboardData) return false
+          const range = selection.getRangeAt(0)
+          const fragment = range.cloneContents()
+          const tempDiv = document.createElement('div')
+          tempDiv.appendChild(fragment)
+          const text = htmlToMarkdown(tempDiv.innerHTML) || selection.toString()
+          event.preventDefault()
+          event.clipboardData.setData('text/plain', text)
+          event.clipboardData.setData('text/html', '')
+          return true
+        },
       },
       handlePaste: (view, event) => {
         // 拦截粘贴的文件（图片等）
@@ -304,8 +396,28 @@ export function RichTextInput({
         return false
       },
       handleKeyDown: (view, event) => {
-        // Enter 提交，Shift+Enter 换行
-        if (event.key === 'Enter' && !event.shiftKey) {
+        // macOS 上 Cmd+B/S 被全局快捷键占用，用 Ctrl+B/S 作为格式化替代键
+        const isMacOS = navigator.platform.startsWith('Mac')
+        if (isMacOS && event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey) {
+          const key = event.key.toLowerCase()
+          if (key === 'b') {
+            event.preventDefault()
+            editor?.chain().focus().toggleBold().run()
+            return true
+          }
+          if (key === 's') {
+            event.preventDefault()
+            editor?.chain().focus().toggleStrike().run()
+            return true
+          }
+        }
+
+        // 发送/换行逻辑：根据 sendWithCmdEnter 模式决定行为
+        if (event.key === 'Enter') {
+          const cmdEnterMode = sendWithCmdEnterRef.current
+          const hasCmd = event.metaKey || event.ctrlKey
+          const hasShift = event.shiftKey
+
           // 如果在代码块中，允许正常换行
           const { state } = view
           const { $from } = state.selection
@@ -319,14 +431,63 @@ export function RichTextInput({
             return false
           }
 
-          // Mention 列表打开时，让 TipTap Mention 处理 Enter
-          if (mentionActiveRef.current) {
+          // Mention 列表打开且有可选项时，让 TipTap Mention 处理 Enter
+          if (mentionActiveRef.current && mentionItemCountRef.current > 0) {
             return false
           }
 
+          // 判断是发送还是换行
+          const isSend = cmdEnterMode ? hasCmd : (!hasShift && !hasCmd)
+
+          if (isSend) {
+            event.preventDefault()
+            onSubmitRef.current()
+            return true
+          }
+
+          // 换行：列表内延续列表项，其他场景插入硬换行（紧凑行距）
           event.preventDefault()
-          onSubmitRef.current()
+          // 检查是否在列表项内（遍历祖先节点）
+          let isInList = false
+          let listItemNode = null
+          for (let d = $from.depth; d > 0; d--) {
+            if ($from.node(d).type.name === 'listItem') {
+              isInList = true
+              listItemNode = $from.node(d)
+              break
+            }
+          }
+          if (isInList && editor) {
+            // 空列表项再次按 Enter：退出列表，回到普通输入
+            if (listItemNode && listItemNode.textContent === '') {
+              editor.chain().focus().liftListItem('listItem').run()
+            } else {
+              editor.chain().focus().splitListItem('listItem').run()
+            }
+          } else if (editor) {
+            editor.chain().focus().splitBlock().run()
+          }
           return true
+        }
+
+        // Backspace：空列表项时退出列表
+        if (event.key === 'Backspace') {
+          const { state } = view
+          const { $from } = state.selection
+          let isInList = false
+          let listItemNode = null
+          for (let d = $from.depth; d > 0; d--) {
+            if ($from.node(d).type.name === 'listItem') {
+              isInList = true
+              listItemNode = $from.node(d)
+              break
+            }
+          }
+          if (isInList && listItemNode && listItemNode.textContent === '' && editor) {
+            event.preventDefault()
+            editor.chain().focus().liftListItem('listItem').run()
+            return true
+          }
         }
 
         return false
@@ -337,12 +498,14 @@ export function RichTextInput({
       if (html === '<p></p>') {
         lastEditorValueRef.current = ''
         onChange('')
+        onHtmlChangeRef.current?.('')
         setIsExpanded(false)
         setIsManuallyCollapsed(false)
       } else {
         const markdown = htmlToMarkdown(html)
         lastEditorValueRef.current = markdown
         onChange(markdown)
+        onHtmlChangeRef.current?.(html)
 
         // 检查行数，超过5行时展开输入框
         const lineCount = countEditorLines(ed)
@@ -365,6 +528,10 @@ export function RichTextInput({
         lastEditorValueRef.current = ''
         setIsExpanded(false)
         setIsManuallyCollapsed(false)
+      } else if (htmlValue) {
+        // 优先使用 HTML 草稿恢复（保留 mention 等富文本节点）
+        editor.commands.setContent(htmlValue)
+        lastEditorValueRef.current = controllerValue
       } else {
         const html = controllerValue
           .split(/\n\n+/)
@@ -412,9 +579,9 @@ export function RichTextInput({
   return (
     <div
       className={cn(
-        'relative w-full overflow-y-auto transition-[max-height] duration-200 ease-in-out',
+        'rich-text-input relative w-full overflow-y-auto transition-[max-height] duration-200 ease-in-out',
         isManuallyCollapsed
-          ? 'max-h-[60px]'
+          ? 'max-h-[101px]'
           : isExpanded ? 'max-h-[500px]' : 'max-h-[200px]',
         disabled && 'opacity-50 cursor-not-allowed',
         className
@@ -445,11 +612,20 @@ export function RichTextInput({
       <style>{`
         .ProseMirror {
           outline: none;
-          padding: 6px 15px 0px;
+          padding: 9px 15px 0px;
           font-style: normal;
         }
         .ProseMirror p {
           font-style: normal;
+          margin: 0;
+        }
+        .ProseMirror ul,
+        .ProseMirror ol {
+          margin: 0;
+          padding-left: 1.5em;
+        }
+        .ProseMirror li {
+          margin: 0;
         }
         .ProseMirror p.is-editor-empty:first-child::before {
           content: attr(data-placeholder);
@@ -467,10 +643,73 @@ export function RichTextInput({
           background-color: hsl(var(--primary) / 0.1);
           color: hsl(var(--primary));
           border-radius: 4px;
-          padding: 1px 4px;
+          padding: 1px 4px 1px 2px;
           font-size: 13px;
           font-weight: 500;
           white-space: nowrap;
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+          vertical-align: baseline;
+        }
+        .mention-chip::before {
+          content: '';
+          display: inline-block;
+          width: 12px;
+          height: 12px;
+          background-color: currentColor;
+          mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z'/%3E%3Cpath d='M14 2v4a2 2 0 0 0 2 2h4'/%3E%3C/svg%3E");
+          mask-size: contain;
+          mask-repeat: no-repeat;
+          flex-shrink: 0;
+        }
+        .skill-mention-chip {
+          background-color: hsl(270 60% 60% / 0.15);
+          color: hsl(270 60% 50%);
+          border-radius: 4px;
+          padding: 1px 4px 1px 2px;
+          font-size: 13px;
+          font-weight: 500;
+          white-space: nowrap;
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+          vertical-align: baseline;
+        }
+        .skill-mention-chip::before {
+          content: '';
+          display: inline-block;
+          width: 12px;
+          height: 12px;
+          background-color: currentColor;
+          mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z'/%3E%3C/svg%3E");
+          mask-size: contain;
+          mask-repeat: no-repeat;
+          flex-shrink: 0;
+        }
+        .mcp-mention-chip {
+          background-color: hsl(160 60% 45% / 0.15);
+          color: hsl(160 60% 35%);
+          border-radius: 4px;
+          padding: 1px 4px 1px 2px;
+          font-size: 13px;
+          font-weight: 500;
+          white-space: nowrap;
+          display: inline-flex;
+          align-items: center;
+          gap: 2px;
+          vertical-align: baseline;
+        }
+        .mcp-mention-chip::before {
+          content: '';
+          display: inline-block;
+          width: 12px;
+          height: 12px;
+          background-color: currentColor;
+          mask-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect width='20' height='8' x='2' y='2' rx='2' ry='2'/%3E%3Crect width='20' height='8' x='2' y='14' rx='2' ry='2'/%3E%3Cline x1='6' x2='6.01' y1='6' y2='6'/%3E%3Cline x1='6' x2='6.01' y1='18' y2='18'/%3E%3C/svg%3E");
+          mask-size: contain;
+          mask-repeat: no-repeat;
+          flex-shrink: 0;
         }
       `}</style>
     </div>

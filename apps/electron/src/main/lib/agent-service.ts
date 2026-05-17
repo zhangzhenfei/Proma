@@ -19,13 +19,17 @@ import type {
   AgentSendInput,
   AgentGenerateTitleInput,
   AgentSaveFilesInput,
+  AgentSaveWorkspaceFilesInput,
   AgentSavedFile,
   AgentStreamEvent,
+  AgentStreamPayload,
+  AgentQueueMessageInput,
+  PromaPermissionMode,
 } from '@proma/shared'
 import { ClaudeAgentAdapter } from './adapters/claude-agent-adapter'
 import { AgentEventBus } from './agent-event-bus'
 import { AgentOrchestrator } from './agent-orchestrator'
-import { getAgentSessionWorkspacePath } from './config-paths'
+import { getAgentSessionWorkspacePath, getWorkspaceFilesDir } from './config-paths'
 
 // ===== 实例创建 =====
 
@@ -46,10 +50,14 @@ const sessionWebContents = new Map<string, WebContents>()
 
 // ===== EventBus IPC 转发中间件 =====
 
-eventBus.use((sessionId, event, next) => {
+eventBus.use((sessionId, payload, next) => {
   const wc = sessionWebContents.get(sessionId)
   if (wc && !wc.isDestroyed()) {
-    wc.send(AGENT_IPC_CHANNELS.STREAM_EVENT, { sessionId, event } as AgentStreamEvent)
+    try {
+      wc.send(AGENT_IPC_CHANNELS.STREAM_EVENT, { sessionId, payload } as AgentStreamEvent)
+    } catch (err) {
+      console.error(`[EventBus] wc.send 失败: sessionId=${sessionId}, payload.kind=${(payload as Record<string, unknown>)?.kind}`, err)
+    }
   }
   next()
 })
@@ -77,11 +85,14 @@ export async function runAgent(
           })
         }
       },
-      onComplete: (messages) => {
+      onComplete: (messages, opts) => {
         if (!webContents.isDestroyed()) {
           webContents.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, {
             sessionId: input.sessionId,
             messages,
+            stoppedByUser: opts?.stoppedByUser ?? false,
+            startedAt: opts?.startedAt,
+            resultSubtype: opts?.resultSubtype,
           })
         }
       },
@@ -136,13 +147,16 @@ export async function runAgentHeadless(
           })
         }
       },
-      onComplete: (messages) => {
+      onComplete: (messages, opts) => {
         callbacks.onComplete()
         // 同步到渲染进程
         if (wc && !wc.isDestroyed()) {
           wc.send(AGENT_IPC_CHANNELS.STREAM_COMPLETE, {
             sessionId: input.sessionId,
             messages,
+            stoppedByUser: opts?.stoppedByUser ?? false,
+            startedAt: opts?.startedAt,
+            resultSubtype: opts?.resultSubtype,
           })
         }
       },
@@ -179,6 +193,16 @@ export function stopAgent(sessionId: string): void {
 }
 
 /**
+ * 快照回退：回退到指定消息点，恢复文件 + 截断对话
+ */
+export async function rewindAgentSession(
+  sessionId: string,
+  assistantMessageUuid: string,
+): Promise<import('@proma/shared').RewindSessionResult> {
+  return orchestrator.rewindSession(sessionId, assistantMessageUuid)
+}
+
+/**
  * 检查指定会话是否正在运行
  */
 export function isAgentSessionActive(sessionId: string): boolean {
@@ -188,6 +212,35 @@ export function isAgentSessionActive(sessionId: string): boolean {
 /** 中止所有活跃的 Agent 会话（应用退出时调用） */
 export function stopAllAgents(): void {
   orchestrator.stopAll()
+}
+
+/**
+ * 运行中动态切换会话的权限模式
+ *
+ * 同时更新 Proma 侧（canUseTool 动态读取）和 SDK 侧（query.setPermissionMode）。
+ */
+export async function updateAgentPermissionMode(sessionId: string, mode: PromaPermissionMode): Promise<void> {
+  await orchestrator.updateSessionPermissionMode(sessionId, mode)
+}
+
+// ===== 流式追加消息 =====
+
+/**
+ * 在 Agent 流式中追加发送消息
+ *
+ * 使用 'now' 优先级立即注入 SDK 并持久化。
+ */
+export async function queueAgentMessage(
+  input: AgentQueueMessageInput,
+  _webContents: WebContents,
+): Promise<string> {
+  return orchestrator.queueMessage(
+    input.sessionId,
+    input.userMessage,
+    undefined,
+    input.uuid,
+    { interrupt: input.interrupt },
+  )
 }
 
 // ===== 文件操作 =====
@@ -227,6 +280,46 @@ export function saveFilesToAgentSession(input: AgentSaveFilesInput): AgentSavedF
     const actualFilename = targetPath.slice(sessionDir.length + 1)
     results.push({ filename: actualFilename, targetPath })
     console.log(`[Agent 服务] 文件已保存: ${targetPath} (${buffer.length} bytes)`)
+  }
+
+  return results
+}
+
+/**
+ * 保存文件到工作区文件目录
+ *
+ * 将 base64 编码的文件写入工作区 workspace-files/ 目录，所有会话均可访问。
+ */
+export function saveFilesToWorkspaceFiles(input: AgentSaveWorkspaceFilesInput): AgentSavedFile[] {
+  const wsFilesDir = getWorkspaceFilesDir(input.workspaceSlug)
+  const results: AgentSavedFile[] = []
+  const usedPaths = new Set<string>()
+
+  for (const file of input.files) {
+    let targetPath = join(wsFilesDir, file.filename)
+
+    // 防止同名文件覆盖
+    if (usedPaths.has(targetPath) || existsSync(targetPath)) {
+      const dotIdx = file.filename.lastIndexOf('.')
+      const baseName = dotIdx > 0 ? file.filename.slice(0, dotIdx) : file.filename
+      const ext = dotIdx > 0 ? file.filename.slice(dotIdx) : ''
+      let counter = 1
+      let candidate = join(wsFilesDir, `${baseName}-${counter}${ext}`)
+      while (usedPaths.has(candidate) || existsSync(candidate)) {
+        counter++
+        candidate = join(wsFilesDir, `${baseName}-${counter}${ext}`)
+      }
+      targetPath = candidate
+    }
+    usedPaths.add(targetPath)
+
+    mkdirSync(dirname(targetPath), { recursive: true })
+    const buffer = Buffer.from(file.data, 'base64')
+    writeFileSync(targetPath, buffer)
+
+    const actualFilename = targetPath.slice(wsFilesDir.length + 1)
+    results.push({ filename: actualFilename, targetPath })
+    console.log(`[Agent 服务] 工作区文件已保存: ${targetPath} (${buffer.length} bytes)`)
   }
 
   return results

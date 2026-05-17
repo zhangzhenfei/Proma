@@ -31,20 +31,11 @@ export function getSettings(): AppSettings {
     const raw = readFileSync(filePath, 'utf-8')
     const data = JSON.parse(raw) as Partial<AppSettings>
     return {
+      ...data,
       themeMode: data.themeMode || DEFAULT_THEME_MODE,
-      agentChannelId: data.agentChannelId,
-      agentModelId: data.agentModelId,
-      agentWorkspaceId: data.agentWorkspaceId,
       onboardingCompleted: data.onboardingCompleted ?? false,
       environmentCheckSkipped: data.environmentCheckSkipped ?? false,
-      lastEnvironmentCheck: data.lastEnvironmentCheck,
       notificationsEnabled: data.notificationsEnabled ?? true,
-      tabState: data.tabState,
-      agentPermissionMode: data.agentPermissionMode,
-      agentThinking: data.agentThinking,
-      agentEffort: data.agentEffort,
-      agentMaxBudgetUsd: data.agentMaxBudgetUsd,
-      agentMaxTurns: data.agentMaxTurns,
     }
   } catch (error) {
     console.error('[设置] 读取失败:', error)
@@ -73,7 +64,7 @@ export function updateSettings(updates: Partial<AppSettings>): AppSettings {
 
   try {
     writeFileSync(filePath, JSON.stringify(updated, null, 2), 'utf-8')
-    console.log('[设置] 已更新:', JSON.stringify(updated))
+    console.log('[设置] 已更新 keys:', Object.keys(updates).join(', '))
   } catch (error) {
     console.error('[设置] 写入失败:', error)
     throw new Error('写入应用设置失败')

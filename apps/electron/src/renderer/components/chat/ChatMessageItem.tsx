@@ -11,7 +11,7 @@
 
 import * as React from 'react'
 import { useAtomValue } from 'jotai'
-import { Pencil, RotateCcw, Trash2 } from 'lucide-react'
+import { AlertCircle, Pencil, RotateCcw, Trash2 } from 'lucide-react'
 import {
   Message,
   MessageHeader,
@@ -30,11 +30,13 @@ import {
   ReasoningContent,
 } from '@/components/ai-elements/reasoning'
 import { CopyButton } from './CopyButton'
+import { MigrateToAgentButton } from './MigrateToAgentButton'
 import { DeleteMessageDialog } from './DeleteMessageDialog'
 import { InlineEditForm } from './InlineEditForm'
 import { UserAvatar } from './UserAvatar'
-import { getModelLogo } from '@/lib/model-logo'
+import { getModelLogo, resolveModelDisplayName } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
+import { channelsAtom } from '@/atoms/chat-atoms'
 import type { ChatMessage } from '@proma/shared'
 import type { InlineEditSubmitPayload } from './InlineEditForm'
 import { ChatToolActivityIndicator } from './ChatToolActivityIndicator'
@@ -67,6 +69,8 @@ export function formatMessageTime(timestamp: number): string {
 interface ChatMessageItemProps {
   /** 消息数据 */
   message: ChatMessage
+  /** 当前对话 ID（用于迁移到 Agent 模式） */
+  conversationId?: string
   /** 是否正在流式生成中 */
   isStreaming?: boolean
   /** 是否为最后一条 assistant 消息（用于显示 StreamingIndicator） */
@@ -91,8 +95,9 @@ interface ChatMessageItemProps {
   isParallelMode?: boolean
 }
 
-export function ChatMessageItem({
+export const ChatMessageItem = React.memo(function ChatMessageItem({
   message,
+  conversationId,
   isStreaming = false,
   isLastAssistant = false,
   onDeleteMessage,
@@ -106,6 +111,7 @@ export function ChatMessageItem({
   const [deleteDialogOpen, setDeleteDialogOpen] = React.useState(false)
   const [isDeleting, setIsDeleting] = React.useState(false)
   const userProfile = useAtomValue(userProfileAtom)
+  const channels = useAtomValue(channelsAtom)
 
   /** 确认删除消息 */
   const handleDeleteConfirm = async (): Promise<void> => {
@@ -134,7 +140,7 @@ export function ChatMessageItem({
         {/* assistant 头像 + 模型名 + 时间 */}
         {message.role === 'assistant' && (
           <MessageHeader
-            model={message.model}
+            model={message.model ? resolveModelDisplayName(message.model, channels) : undefined}
             time={formatMessageTime(message.createdAt)}
             logo={
               <img
@@ -157,7 +163,7 @@ export function ChatMessageItem({
           </div>
         )}
 
-        <MessageContent>
+        <MessageContent className={isInlineEditing ? 'w-full' : undefined}>
           {message.role === 'assistant' ? (
             <>
               {/* 工具活动记录（历史消息） */}
@@ -185,9 +191,24 @@ export function ChatMessageItem({
                     <StreamingIndicator />
                   )}
                 </>
+              ) : message.error ? (
+                null
               ) : message.stopped ? (
                 <MessageStopped />
               ) : null}
+
+              {/* 错误提示 */}
+              {message.error && (
+                <div className="mt-1 px-3 py-2 rounded-md bg-destructive/10 text-destructive text-sm flex items-center gap-2">
+                  <AlertCircle className="size-4 shrink-0" />
+                  <span className="break-all">{message.error}</span>
+                </div>
+              )}
+
+              {/* 生成的图片附件（如 Nano Banana 生图结果） */}
+              {message.attachments && message.attachments.length > 0 && (
+                <MessageAttachments attachments={message.attachments} />
+              )}
             </>
           ) : (
             /* 用户消息 - 附件 + 可折叠文本 / 原地编辑 */
@@ -209,9 +230,12 @@ export function ChatMessageItem({
         </MessageContent>
 
         {/* 操作按钮（非 streaming 时显示，hover 时可见） */}
-        {(message.content || (message.attachments && message.attachments.length > 0)) && !isStreaming && !isInlineEditing && (
+        {(message.content || message.error || (message.attachments && message.attachments.length > 0)) && !isStreaming && !isInlineEditing && (
           <MessageActions className="pl-[46px] mt-0.5">
             <CopyButton content={message.content} />
+            {message.role === 'assistant' && conversationId && (
+              <MigrateToAgentButton conversationId={conversationId} />
+            )}
             {message.role === 'user' && onResendMessage && (
               <MessageAction
                 tooltip="重新发送"
@@ -236,7 +260,13 @@ export function ChatMessageItem({
                 <Trash2 className="size-3.5" />
               </MessageAction>
             )}
-            {message.role === 'assistant' && message.stopped && (
+            {message.role === 'assistant' && message.error && (
+              <span className="text-[11px] text-destructive ml-1 flex items-center gap-0.5">
+                <AlertCircle className="size-3" />
+                生成失败
+              </span>
+            )}
+            {message.role === 'assistant' && message.stopped && !message.error && (
               <span className="text-[11px] text-foreground/40 ml-1">（已中止）</span>
             )}
           </MessageActions>
@@ -252,4 +282,4 @@ export function ChatMessageItem({
       />
     </>
   )
-}
+})

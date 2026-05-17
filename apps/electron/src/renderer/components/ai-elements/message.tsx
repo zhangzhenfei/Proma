@@ -18,13 +18,14 @@
  */
 
 import * as React from 'react'
-import Markdown from 'react-markdown'
+import Markdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
-import { ChevronDown, ChevronUp, Paperclip, FileText } from 'lucide-react'
+import { ChevronDown, ChevronUp, Paperclip, FileText, Sparkles, Server, Download } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Button } from '@/components/ui/button'
+import { ImageLightbox } from '@/components/ui/image-lightbox'
 import {
   Tooltip,
   TooltipContent,
@@ -33,6 +34,7 @@ import {
 } from '@/components/ui/tooltip'
 import { LoadingIndicator } from '@/components/ui/loading-indicator'
 import { CodeBlock, MermaidBlock } from '@proma/ui'
+import { FilePathChip, isAbsoluteFilePath, isRelativeFilePath } from './file-path-chip'
 import type { HTMLAttributes, ComponentProps, ReactNode } from 'react'
 import type { FileAttachment } from '@proma/shared'
 
@@ -50,7 +52,7 @@ export function Message({ className, from, ...props }: MessageProps): React.Reac
   return (
     <div
       className={cn(
-        'group flex w-full flex-col gap-0.5 rounded-[10px] px-2.5 py-2.5 transition-colors duration-300',
+        'group flex w-full flex-col gap-0.5 rounded-[10px] px-2.5 py-2.5',
         from === 'user' ? 'is-user' : 'is-assistant',
         className
       )}
@@ -119,9 +121,9 @@ export function MessageContent({
   return (
     <div
       className={cn(
-        'flex w-full max-w-full min-w-0 flex-col gap-2 overflow-hidden pl-[46px]',
-        'group-[.is-user]:text-foreground',
-        'group-[.is-assistant]:text-foreground',
+        'flex max-w-full min-w-0 flex-col gap-2 overflow-hidden pl-[46px]',
+        'group-[.is-user]:text-foreground group-[.is-user]:items-start',
+        'group-[.is-assistant]:w-full group-[.is-assistant]:text-foreground',
         className
       )}
       {...props}
@@ -197,19 +199,315 @@ export function MessageAction({
 
 // ===== MessageResponse Markdown 渲染 =====
 
+// ----- mdast 节点类型（remark 自定义插件用） -----
+
+interface MdastTextNode {
+  type: 'text'
+  value: string
+}
+
+interface MdastLinkNode {
+  type: 'link'
+  url: string
+  children: MdastNode[]
+}
+
+interface MdastBreakNode {
+  type: 'break'
+}
+
+interface MdastGenericNode {
+  type: string
+  children?: MdastNode[]
+  value?: string
+}
+
+type MdastNode = MdastTextNode | MdastLinkNode | MdastBreakNode | MdastGenericNode
+
+interface MdastParent {
+  type: string
+  children: MdastNode[]
+}
+
+// ----- mdast 工具函数 -----
+
+/** 递归遍历 mdast text 节点（自动跳过 code / inlineCode 子树） */
+function walkMdastText(
+  node: MdastParent,
+  visitor: (node: MdastTextNode, index: number, parent: MdastParent) => number | void
+): void {
+  if (!node.children) return
+  for (let i = 0; i < node.children.length; i++) {
+    const child = node.children[i]!
+    if (child.type === 'text') {
+      const result = visitor(child as MdastTextNode, i, node)
+      if (typeof result === 'number') i = result - 1
+    } else if (child.type !== 'code' && child.type !== 'inlineCode') {
+      const asParent = child as MdastParent
+      if (asParent.children) walkMdastText(asParent, visitor)
+    }
+  }
+}
+
+// ----- MentionChip 组件 -----
+
+type MentionType = 'file' | 'skill' | 'mcp'
+
+const MENTION_STYLES: Record<MentionType, { icon: typeof FileText; className: string }> = {
+  file: { icon: FileText, className: 'bg-primary/10 text-primary' },
+  skill: { icon: Sparkles, className: 'bg-[hsl(270_60%_60%/0.15)] text-[hsl(270_60%_50%)]' },
+  mcp: { icon: Server, className: 'bg-[hsl(160_60%_45%/0.15)] text-[hsl(160_60%_35%)]' },
+}
+
+function MentionChip({ type, value }: { type: MentionType; value: string }): React.ReactElement {
+  const style = MENTION_STYLES[type]
+  const Icon = style.icon
+  const display = type === 'file' ? (value.split('/').pop() || value) : value
+  return (
+    <span
+      className={cn(
+        'inline-flex items-center gap-0.5 rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline',
+        style.className
+      )}
+      title={type === 'file' ? value : undefined}
+    >
+      <Icon className="size-3 inline shrink-0" />
+      {display}
+    </span>
+  )
+}
+
+// ----- remarkMentions：将 @file: /skill: #mcp: 转为 mention:// link 节点 -----
+
+export function remarkMentions() {
+  return (tree: MdastParent) => {
+    walkMdastText(tree, (node, index, parent) => {
+      const text = node.value
+      // 每次调用创建独立正则实例，避免 /g 状态在并发 remark pipeline 间互相干扰
+      const mentionPattern = /@file:(\S+)|\/skill:(\S+)|#mcp:(\S+)/g
+      if (!mentionPattern.test(text)) return
+      mentionPattern.lastIndex = 0
+
+      const parts: MdastNode[] = []
+      let lastIdx = 0
+      let m: RegExpExecArray | null
+
+      while ((m = mentionPattern.exec(text)) !== null) {
+        if (m.index > lastIdx) {
+          parts.push({ type: 'text', value: text.slice(lastIdx, m.index) })
+        }
+        const mType: MentionType = m[1] ? 'file' : m[2] ? 'skill' : 'mcp'
+        const mValue = m[1] || m[2] || m[3]
+        parts.push({
+          type: 'link',
+          url: `mention://${mType}/${mValue}`,
+          children: [{ type: 'text', value: m[0] }],
+        })
+        lastIdx = m.index + m[0].length
+      }
+
+      if (lastIdx < text.length) {
+        parts.push({ type: 'text', value: text.slice(lastIdx) })
+      }
+
+      parent.children.splice(index, 1, ...parts)
+      return index + parts.length
+    })
+  }
+}
+
+// ----- remarkPreserveBreaks：在 text 节点中将 \n 转为 break 节点（跳过代码块） -----
+
+export function remarkPreserveBreaks() {
+  return (tree: MdastParent) => {
+    walkMdastText(tree, (node, index, parent) => {
+      const text = node.value
+      if (!text.includes('\n')) return
+
+      const lines = text.split('\n')
+      const parts: MdastNode[] = []
+
+      for (let i = 0; i < lines.length; i++) {
+        if (i > 0) parts.push({ type: 'break' })
+        if (lines[i]) parts.push({ type: 'text', value: lines[i] })
+      }
+
+      parent.children.splice(index, 1, ...parts)
+      return index + parts.length
+    })
+  }
+}
+
+/** remark 插件函数签名 */
+export type RemarkPluginFn = () => (tree: MdastParent) => void
+
+/**
+ * 附加 basePaths 上下文 — 用于把"附加目录候选"穿透到 MarkdownInlineCode 而不必逐层透传 props。
+ * AgentMessages 在顶层用 BasePathsProvider 包裹，FilePathChip 渲染时会自动取到。
+ */
+const BasePathsContext = React.createContext<string[] | undefined>(undefined)
+
+/** 提供附加目录候选给所有内嵌的 MessageResponse */
+export function BasePathsProvider({ basePaths, children }: { basePaths?: string[]; children: React.ReactNode }): React.ReactElement {
+  return <BasePathsContext.Provider value={basePaths}>{children}</BasePathsContext.Provider>
+}
+
 interface MessageResponseProps {
   /** Markdown 内容 */
   children: string
   className?: string
+  /** 基础目录路径，用于解析相对文件路径（如 Agent 会话工作目录） */
+  basePath?: string
+  /** 额外的基础目录候选（如附加目录），点击 chip 时由主进程依次解析 */
+  basePaths?: string[]
+  /** 额外的 remark 插件（追加到内置 remarkGfm + remarkMath 之后） */
+  remarkPlugins?: RemarkPluginFn[]
 }
+
+/** 稳定引用的插件数组，避免 react-markdown 每帧重建插件管线 */
+const REMARK_PLUGINS = [remarkGfm, remarkMath]
+const REHYPE_PLUGINS = [rehypeKatex]
+
+/** 允许 mention:// 协议通过 URL 清洗（react-markdown 默认只放行 http/https） */
+function mentionUrlTransform(url: string): string {
+  if (url.startsWith('mention://')) return url
+  return defaultUrlTransform(url)
+}
+
+// ===== Memo'd Markdown 子组件（稳定引用，避免 react-markdown 每帧重建组件映射） =====
+
+/** mention:// URL 匹配 */
+const MENTION_URL_RE = /^mention:\/\/(file|skill|mcp)\/(.+)$/
+
+/** 外部链接 / mention chip 渲染器 */
+const MarkdownLink = React.memo(function MarkdownLink({
+  href,
+  children: linkChildren,
+  ...linkProps
+}: React.AnchorHTMLAttributes<HTMLAnchorElement>): React.ReactElement {
+  // mention:// 协议 → 渲染为 MentionChip
+  if (href) {
+    const mentionMatch = MENTION_URL_RE.exec(href)
+    if (mentionMatch) {
+      return <MentionChip type={mentionMatch[1] as MentionType} value={mentionMatch[2] ?? ''} />
+    }
+  }
+
+  return (
+    <a
+      {...linkProps}
+      href={href}
+      onClick={(e) => {
+        e.preventDefault()
+        if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
+          window.electronAPI.openExternal(href)
+        }
+      }}
+      title={href}
+    >
+      {linkChildren}
+    </a>
+  )
+})
+
+/** 递归提取纯文本（children 可能是字符串数组） */
+function extractText(node: React.ReactNode): string {
+  if (typeof node === 'string') return node
+  if (typeof node === 'number') return String(node)
+  if (!node) return ''
+  if (Array.isArray(node)) return node.map(extractText).join('')
+  if (React.isValidElement(node)) {
+    return extractText((node.props as { children?: React.ReactNode }).children)
+  }
+  return ''
+}
+
+/** 代码块 / Mermaid 渲染器 */
+const MarkdownPre = React.memo(function MarkdownPre({
+  children: preChildren,
+}: { children?: React.ReactNode }): React.ReactElement {
+  const codeChild = React.Children.toArray(preChildren).find(
+    (child): child is React.ReactElement =>
+      React.isValidElement(child) && (child as React.ReactElement).type === 'code'
+  ) as React.ReactElement | undefined
+
+  if (codeChild) {
+    const codeProps = codeChild.props as { className?: string; children?: React.ReactNode }
+    if (codeProps.className?.includes('language-mermaid')) {
+      const mermaidCode = extractText(codeProps.children).replace(/\n$/, '')
+      return <MermaidBlock code={mermaidCode} />
+    }
+  }
+
+  return <CodeBlock>{preChildren}</CodeBlock>
+})
+
+/** 行内代码 / 文件路径渲染器 */
+const MarkdownInlineCode = React.memo(function MarkdownInlineCode({
+  children: codeChildren,
+  className: codeClassName,
+  basePath,
+  basePaths,
+  ...codeProps
+}: React.HTMLAttributes<HTMLElement> & { basePath?: string; basePaths?: string[] }): React.ReactElement {
+  // 兜底：从 context 读附加 basePaths（避免穿透 SDKMessageRenderer / ContentBlock 等中间层）
+  const ctxBasePaths = React.useContext(BasePathsContext)
+  if (codeClassName) {
+    return <code className={codeClassName} {...codeProps}>{codeChildren}</code>
+  }
+
+  const text = typeof codeChildren === 'string' ? codeChildren : ''
+
+  if (text) {
+    if (isAbsoluteFilePath(text)) {
+      return <FilePathChip filePath={text.trim()} />
+    }
+    // 相对路径：合并 basePath（主 cwd）+ basePaths（props 或 context 提供的附加目录）作为候选
+    const merged: string[] = []
+    if (basePath) merged.push(basePath)
+    const allExtra = basePaths || ctxBasePaths
+    if (allExtra) {
+      for (const p of allExtra) {
+        if (p && !merged.includes(p)) merged.push(p)
+      }
+    }
+    if (merged.length > 0 && isRelativeFilePath(text)) {
+      return <FilePathChip filePath={text.trim()} basePaths={merged} />
+    }
+  }
+
+  return (
+    <code
+      className="rounded bg-foreground/10 px-[0.35em] py-[0.15em] text-[0.875em] font-medium"
+      {...codeProps}
+    >
+      {codeChildren}
+    </code>
+  )
+})
 
 /** 使用 react-markdown 渲染 assistant 消息内容，代码块使用 Shiki 语法高亮 */
 export const MessageResponse = React.memo(
-  function MessageResponse({ children, className }: MessageResponseProps): React.ReactElement {
+  function MessageResponse({ children, className, basePath, basePaths, remarkPlugins }: MessageResponseProps): React.ReactElement {
+    // 合并内置 + 外部 remark 插件（保持引用稳定）
+    const mergedRemarkPlugins = React.useMemo(
+      () => remarkPlugins ? [...REMARK_PLUGINS, ...remarkPlugins] : REMARK_PLUGINS,
+      [remarkPlugins]
+    )
+
+    // 稳定引用的 components 对象，避免 react-markdown 每帧重建组件映射
+    const components = React.useMemo(() => ({
+      a: MarkdownLink,
+      pre: MarkdownPre,
+      code: (props: React.HTMLAttributes<HTMLElement>) => (
+        <MarkdownInlineCode {...props} basePath={basePath} basePaths={basePaths} />
+      ),
+    }), [basePath, basePaths])
+
     return (
       <div
         className={cn(
-          'prose dark:prose-invert max-w-none text-[14px]',
+          'prose dark:prose-invert max-w-none text-[15px]',
           'prose-p:my-1.5 prose-p:leading-[1.6] prose-li:leading-[1.6] prose-pre:my-0 prose-headings:my-2',
           '[&_.code-block-wrapper+.code-block-wrapper]:mt-4',
           '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
@@ -217,60 +515,21 @@ export const MessageResponse = React.memo(
         )}
       >
         <Markdown
-          remarkPlugins={[remarkGfm, remarkMath]}
-          rehypePlugins={[rehypeKatex]}
-          components={{
-            a: ({ href, children: linkChildren, ...linkProps }) => (
-              <a
-                {...linkProps}
-                href={href}
-                onClick={(e) => {
-                  e.preventDefault()
-                  if (href && (href.startsWith('http://') || href.startsWith('https://'))) {
-                    window.electronAPI.openExternal(href)
-                  }
-                }}
-                title={href}
-              >
-                {linkChildren}
-              </a>
-            ),
-            pre: ({ children: preChildren }) => {
-              // 检测子 <code> 元素的 className 是否包含 language-mermaid
-              const codeChild = React.Children.toArray(preChildren).find(
-                (child): child is React.ReactElement =>
-                  React.isValidElement(child) && (child as React.ReactElement).type === 'code'
-              ) as React.ReactElement | undefined
-
-              if (codeChild) {
-                const codeProps = codeChild.props as { className?: string; children?: React.ReactNode }
-                if (codeProps.className?.includes('language-mermaid')) {
-                  // 递归提取纯文本（children 可能是字符串数组）
-                  const extractText = (node: React.ReactNode): string => {
-                    if (typeof node === 'string') return node
-                    if (typeof node === 'number') return String(node)
-                    if (!node) return ''
-                    if (Array.isArray(node)) return node.map(extractText).join('')
-                    if (React.isValidElement(node)) {
-                      return extractText((node.props as { children?: React.ReactNode }).children)
-                    }
-                    return ''
-                  }
-                  const mermaidCode = extractText(codeProps.children).replace(/\n$/, '')
-                  return <MermaidBlock code={mermaidCode} />
-                }
-              }
-
-              return <CodeBlock>{preChildren}</CodeBlock>
-            },
-          }}
+          remarkPlugins={mergedRemarkPlugins}
+          rehypePlugins={REHYPE_PLUGINS}
+          urlTransform={mentionUrlTransform}
+          components={components}
         >
           {children}
         </Markdown>
       </div>
     )
   },
-  (prevProps, nextProps) => prevProps.children === nextProps.children
+  (prevProps, nextProps) =>
+    prevProps.children === nextProps.children &&
+    prevProps.basePath === nextProps.basePath &&
+    prevProps.basePaths === nextProps.basePaths &&
+    prevProps.remarkPlugins === nextProps.remarkPlugins
 )
 
 // ===== UserMessageContent 可折叠用户消息 =====
@@ -278,45 +537,8 @@ export const MessageResponse = React.memo(
 /** 折叠行数阈值 */
 const COLLAPSE_LINE_THRESHOLD = 4
 
-/** 将文本中的 @file:路径 替换为样式化 chip */
-const FILE_MENTION_RE = /@file:(\S+)/g
-
-function renderTextWithMentions(text: string): React.ReactNode {
-  const parts: React.ReactNode[] = []
-  let lastIndex = 0
-  let match: RegExpExecArray | null
-
-  // 重置 lastIndex（全局正则复用时需要）
-  FILE_MENTION_RE.lastIndex = 0
-
-  while ((match = FILE_MENTION_RE.exec(text)) !== null) {
-    // 添加 match 前的纯文本
-    if (match.index > lastIndex) {
-      parts.push(text.slice(lastIndex, match.index))
-    }
-    // 渲染 mention chip
-    const filePath = match[1] ?? ''
-    const fileName = filePath.split('/').pop() || filePath
-    parts.push(
-      <span
-        key={`mention-${match.index}`}
-        className="inline-flex items-center gap-0.5 bg-primary/10 text-primary rounded px-1 py-[1px] text-[13px] font-medium whitespace-nowrap align-baseline"
-        title={filePath}
-      >
-        <FileText className="size-3 inline shrink-0" />
-        {fileName}
-      </span>
-    )
-    lastIndex = match.index + match[0].length
-  }
-
-  // 添加剩余文本
-  if (lastIndex < text.length) {
-    parts.push(text.slice(lastIndex))
-  }
-
-  return parts.length > 0 ? parts : text
-}
+/** 用户消息专用 remark 插件（mention chip + 保留换行） */
+const USER_REMARK_PLUGINS: RemarkPluginFn[] = [remarkMentions, remarkPreserveBreaks]
 
 interface UserMessageContentProps extends HTMLAttributes<HTMLDivElement> {
   children: string
@@ -350,16 +572,16 @@ export const UserMessageContent = React.memo(
     }, [])
 
     return (
-      <div className={cn('relative rounded-[10px] bg-foreground/[0.045] dark:bg-foreground/[0.08] px-3.5 py-2.5', shouldCollapse && !isExpanded && 'pb-6', className)} {...props}>
+      <div className={cn('relative inline-block max-w-full rounded-[10px] bg-primary/10 px-3.5 py-2.5', shouldCollapse && !isExpanded && 'pb-6', className)} {...props}>
         <div
           ref={contentRef}
           className={cn(
-            'whitespace-pre-wrap overflow-hidden transition-[max-height] duration-200 text-[14px] leading-[1.6]',
+            'overflow-hidden transition-[max-height] duration-200',
             '[&>*:first-child]:mt-0 [&>*:last-child]:mb-0',
             shouldCollapse && !isExpanded && 'max-h-[6.5em]'
           )}
         >
-          {renderTextWithMentions(children)}
+          <MessageResponse className="prose-p:my-0.5 prose-headings:my-1.5" remarkPlugins={USER_REMARK_PLUGINS}>{children}</MessageResponse>
         </div>
         {shouldCollapse && (
           <button
@@ -368,7 +590,7 @@ export const UserMessageContent = React.memo(
             className={cn(
               'flex items-center gap-1 text-xs text-foreground/40 hover:text-foreground/70 transition-colors mt-1',
               !isExpanded &&
-                'absolute bottom-0 left-0 right-0 px-3.5 pb-2.5 pt-4 rounded-b-[10px] bg-gradient-to-t from-foreground/[0.045] dark:from-foreground/[0.08] to-transparent'
+                'absolute bottom-0 left-0 right-0 px-3.5 pb-2.5 pt-4 rounded-b-[10px] bg-gradient-to-t from-primary/10 to-transparent'
             )}
           >
             {isExpanded ? (
@@ -472,9 +694,10 @@ interface MessageAttachmentImageProps {
   isSingle?: boolean
 }
 
-/** 图片附件展示（单图: max 500px，多图: 280px 方块） */
+/** 图片附件展示（单图: max 500px，多图: 280px 方块），点击可预览大图 */
 function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachmentImageProps): React.ReactElement {
   const [imageSrc, setImageSrc] = React.useState<string | null>(null)
+  const [lightboxOpen, setLightboxOpen] = React.useState(false)
 
   React.useEffect(() => {
     window.electronAPI
@@ -487,6 +710,11 @@ function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachm
       })
   }, [attachment.localPath, attachment.mediaType])
 
+  /** 保存图片到本地 */
+  const handleSave = React.useCallback((): void => {
+    window.electronAPI.saveImageAs(attachment.localPath, attachment.filename)
+  }, [attachment.localPath, attachment.filename])
+
   if (!imageSrc) {
     return (
       <div className={cn(
@@ -496,18 +724,41 @@ function MessageAttachmentImage({ attachment, isSingle = false }: MessageAttachm
     )
   }
 
-  return isSingle ? (
+  const imgElement = isSingle ? (
     <img
       src={imageSrc}
       alt={attachment.filename}
-      className="max-w-[500px] max-h-[min(500px,50vh)] rounded-lg object-contain"
+      className="max-w-[500px] max-h-[min(500px,50vh)] rounded-lg object-contain cursor-pointer"
+      onClick={() => setLightboxOpen(true)}
     />
   ) : (
     <img
       src={imageSrc}
       alt={attachment.filename}
-      className="size-[280px] rounded-lg object-cover shrink-0"
+      className="size-[280px] rounded-lg object-cover shrink-0 cursor-pointer"
+      onClick={() => setLightboxOpen(true)}
     />
+  )
+
+  return (
+    <div className="relative group inline-block">
+      {imgElement}
+      <button
+        type="button"
+        onClick={handleSave}
+        className="absolute bottom-2 right-2 p-1.5 rounded-md bg-black/50 text-white opacity-0 group-hover:opacity-100 transition-opacity hover:bg-black/70"
+        title="保存图片"
+      >
+        <Download className="size-4" />
+      </button>
+      <ImageLightbox
+        src={imageSrc}
+        alt={attachment.filename}
+        open={lightboxOpen}
+        onOpenChange={setLightboxOpen}
+        onSave={handleSave}
+      />
+    </div>
   )
 }
 

@@ -7,6 +7,7 @@
  */
 
 import { readFileSync, writeFileSync, appendFileSync, existsSync, unlinkSync } from 'node:fs'
+import { writeJsonFileAtomic, readJsonFileSafe } from './safe-file'
 import { randomUUID } from 'node:crypto'
 import {
   getConversationsIndexPath,
@@ -14,7 +15,7 @@ import {
   getConversationMessagesPath,
 } from './config-paths'
 import { deleteConversationAttachments, deleteAttachment } from './attachment-service'
-import type { ConversationMeta, ChatMessage, RecentMessagesResult } from '@proma/shared'
+import type { ConversationMeta, ChatMessage, RecentMessagesResult, MessageSearchResult } from '@proma/shared'
 
 /**
  * 对话索引文件格式
@@ -34,18 +35,9 @@ const INDEX_VERSION = 1
  */
 function readIndex(): ConversationsIndex {
   const indexPath = getConversationsIndexPath()
-
-  if (!existsSync(indexPath)) {
-    return { version: INDEX_VERSION, conversations: [] }
-  }
-
-  try {
-    const raw = readFileSync(indexPath, 'utf-8')
-    return JSON.parse(raw) as ConversationsIndex
-  } catch (error) {
-    console.error('[对话管理] 读取索引文件失败:', error)
-    return { version: INDEX_VERSION, conversations: [] }
-  }
+  const data = readJsonFileSafe<ConversationsIndex>(indexPath)
+  if (data) return data
+  return { version: INDEX_VERSION, conversations: [] }
 }
 
 /**
@@ -55,7 +47,7 @@ function writeIndex(index: ConversationsIndex): void {
   const indexPath = getConversationsIndexPath()
 
   try {
-    writeFileSync(indexPath, JSON.stringify(index, null, 2), 'utf-8')
+    writeJsonFileAtomic(indexPath, index)
   } catch (error) {
     console.error('[对话管理] 写入索引文件失败:', error)
     throw new Error('写入对话索引失败')
@@ -183,6 +175,16 @@ export function appendMessage(id: string, message: ChatMessage): void {
   try {
     const line = JSON.stringify(message) + '\n'
     appendFileSync(filePath, line, 'utf-8')
+
+    // 追加消息时更新 updatedAt，若已归档则自动恢复活跃
+    const index = readIndex()
+    const idx = index.conversations.findIndex((c) => c.id === id)
+    if (idx !== -1) {
+      const conv = index.conversations[idx]!
+      conv.updatedAt = Date.now()
+      if (conv.archived) conv.archived = false
+      writeIndex(index)
+    }
   } catch (error) {
     console.error(`[对话管理] 追加消息失败 (${id}):`, error)
     throw new Error('追加消息失败')
@@ -218,7 +220,7 @@ export function saveConversationMessages(id: string, messages: ChatMessage[]): v
  */
 export function updateConversationMeta(
   id: string,
-  updates: Partial<Pick<ConversationMeta, 'title' | 'modelId' | 'channelId' | 'contextDividers' | 'contextLength' | 'pinned'>>,
+  updates: Partial<Pick<ConversationMeta, 'title' | 'modelId' | 'channelId' | 'contextDividers' | 'contextLength' | 'pinned' | 'archived'>>,
 ): ConversationMeta {
   const index = readIndex()
   const idx = index.conversations.findIndex((c) => c.id === id)
@@ -228,9 +230,12 @@ export function updateConversationMeta(
   }
 
   const existing = index.conversations[idx]!
+  // 非手动归档操作时，若对话已归档则自动恢复为活跃
+  const autoUnarchive = existing.archived && !('archived' in updates)
   const updated: ConversationMeta = {
     ...existing,
     ...updates,
+    ...(autoUnarchive ? { archived: false } : {}),
     updatedAt: Date.now(),
   }
 
@@ -253,7 +258,8 @@ export function deleteConversation(id: string): void {
   const idx = index.conversations.findIndex((c) => c.id === id)
 
   if (idx === -1) {
-    throw new Error(`对话不存在: ${id}`)
+    console.warn(`[对话管理] 对话不存在，跳过删除: ${id}`)
+    return
   }
 
   const removed = index.conversations.splice(idx, 1)[0]!
@@ -358,4 +364,97 @@ export function truncateMessagesFrom(
  */
 export function updateContextDividers(conversationId: string, dividers: string[]): ConversationMeta {
   return updateConversationMeta(conversationId, { contextDividers: dividers })
+}
+
+/**
+ * 自动归档超过指定天数未更新的对话
+ *
+ * 置顶对话不会被归档。
+ *
+ * @param daysThreshold 天数阈值
+ * @returns 本次归档的对话数量
+ */
+export function autoArchiveConversations(daysThreshold: number): number {
+  const index = readIndex()
+  const threshold = Date.now() - daysThreshold * 86_400_000
+  let count = 0
+
+  for (const conv of index.conversations) {
+    if (!conv.pinned && !conv.archived && conv.updatedAt < threshold) {
+      conv.archived = true
+      count++
+    }
+  }
+
+  if (count > 0) {
+    writeIndex(index)
+    console.log(`[对话管理] 自动归档 ${count} 个对话（阈值: ${daysThreshold} 天）`)
+  }
+
+  return count
+}
+
+/**
+ * 搜索对话消息内容
+ *
+ * 遍历所有对话的 JSONL 文件，逐行搜索 content 字段。
+ * 每个对话最多返回 1 条最佳匹配，总计最多 30 条结果。
+ *
+ * @param query 搜索关键词
+ * @returns 匹配结果列表
+ */
+export function searchConversationMessages(query: string): MessageSearchResult[] {
+  if (!query || query.length < 2) return []
+
+  const index = readIndex()
+  const results: MessageSearchResult[] = []
+  const queryLower = query.toLowerCase()
+  const maxResults = 30
+
+  for (const conv of index.conversations) {
+    if (results.length >= maxResults) break
+
+    const filePath = getConversationMessagesPath(conv.id)
+    if (!existsSync(filePath)) continue
+
+    try {
+      const raw = readFileSync(filePath, 'utf-8')
+      const lines = raw.split('\n').filter((line) => line.trim())
+
+      for (const line of lines) {
+        const msg = JSON.parse(line) as ChatMessage
+        if (!msg.content) continue
+
+        const contentLower = msg.content.toLowerCase()
+        const matchIndex = contentLower.indexOf(queryLower)
+        if (matchIndex === -1) continue
+
+        // 提取匹配上下文 snippet（匹配词前后各约 40 字符）
+        const snippetStart = Math.max(0, matchIndex - 40)
+        const snippetEnd = Math.min(msg.content.length, matchIndex + query.length + 40)
+        const snippet = (snippetStart > 0 ? '...' : '') +
+          msg.content.slice(snippetStart, snippetEnd) +
+          (snippetEnd < msg.content.length ? '...' : '')
+        const matchStart = matchIndex - snippetStart + (snippetStart > 0 ? 3 : 0)
+
+        results.push({
+          conversationId: conv.id,
+          conversationTitle: conv.title,
+          messageId: msg.id,
+          role: msg.role,
+          snippet,
+          matchStart,
+          matchLength: query.length,
+          archived: conv.archived,
+        })
+
+        // 每个对话只取 1 条匹配
+        break
+      }
+    } catch {
+      // 跳过读取失败的文件
+    }
+  }
+
+  return results
 }

@@ -6,9 +6,9 @@
  */
 
 import * as React from 'react'
-import { Folder, FileText } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import type { FileIndexEntry } from '@proma/shared'
+import { FileTypeIcon } from './FileTypeIcon'
 
 export interface FileMentionListProps {
   items: FileIndexEntry[]
@@ -50,6 +50,7 @@ export const FileMentionList = React.forwardRef<FileMentionRef, FileMentionListP
           return true
         }
         if (event.key === 'Enter') {
+          if (items.length === 0) return false
           const item = items[localIndex]
           if (item) onSelect(item)
           return true
@@ -73,7 +74,7 @@ export const FileMentionList = React.forwardRef<FileMentionRef, FileMentionListP
     return (
       <div
         ref={containerRef}
-        className="rounded-lg border bg-popover shadow-lg overflow-y-auto max-h-[200px] min-w-[200px]"
+        className="rounded-lg border bg-popover shadow-lg overflow-y-auto max-h-[280px] min-w-[200px]"
       >
         {items.map((item, index) => (
           <button
@@ -85,11 +86,7 @@ export const FileMentionList = React.forwardRef<FileMentionRef, FileMentionListP
             )}
             onClick={() => onSelect(item)}
           >
-            {item.type === 'dir' ? (
-              <Folder className="size-3 text-amber-500 flex-shrink-0" />
-            ) : (
-              <FileText className="size-3 text-muted-foreground flex-shrink-0" />
-            )}
+            <FileTypeIcon name={item.name} isDirectory={item.type === 'dir'} size={12} />
             <span className="truncate flex-1">{item.name}</span>
             {/* 显示相对路径（当路径不等于文件名时） */}
             {item.path !== item.name && (

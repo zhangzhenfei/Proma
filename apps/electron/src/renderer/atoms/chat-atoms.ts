@@ -7,7 +7,13 @@
 
 import { atom } from 'jotai'
 import { atomWithStorage } from 'jotai/utils'
-import type { ConversationMeta, ChatMessage, FileAttachment, ChatToolActivity } from '@proma/shared'
+import type { ConversationMeta, ChatMessage, FileAttachment, ChatToolActivity, Channel } from '@proma/shared'
+
+/** 全局渠道列表缓存（启动时加载一次，设置变更时刷新） */
+export const channelsAtom = atom<Channel[]>([])
+
+/** 渠道列表是否已完成首次加载 */
+export const channelsLoadedAtom = atom(false)
 
 /** 选中的模型信息 */
 export interface SelectedModel {
@@ -38,6 +44,8 @@ export interface ConversationStreamState {
   model?: string
   /** 记忆工具活动列表（流式期间累积） */
   toolActivities: ChatToolActivity[]
+  /** 流式开始时间戳（用于思考计时持久化） */
+  startedAt?: number
 }
 
 /**
@@ -204,6 +212,19 @@ export const currentConversationDraftAtom = atom(
   }
 )
 
+// ===== 快速任务待发送消息 =====
+
+/** Chat 模式待发送消息（从快速任务窗口注入） */
+export interface ChatPendingMessage {
+  conversationId: string
+  message: string
+  /** 已保存的附件（从快速任务窗口传入时已通过 IPC 保存到磁盘） */
+  attachments?: FileAttachment[]
+}
+
+/** 快速任务窗口提交后写入，ChatView 检测到后自动发送并清除 */
+export const chatPendingMessageAtom = atom<ChatPendingMessage | null>(null)
+
 /**
  * Chat 消息刷新版本 Map — 以 conversationId 为 key
  * 全局监听器在流式完成/错误时递增版本号，
@@ -240,3 +261,9 @@ export const conversationThinkingEnabledAtom = atom<Map<string, boolean>>(new Ma
 
 /** 每个对话的并排模式 */
 export const conversationParallelModeAtom = atom<Map<string, boolean>>(new Map())
+
+/** 思考块默认展开偏好（持久化到 localStorage） */
+export const thinkingExpandedAtom = atomWithStorage<boolean>(
+  'proma-thinking-expanded',
+  false,
+)

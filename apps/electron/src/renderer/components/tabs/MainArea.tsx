@@ -1,58 +1,55 @@
 /**
  * MainArea — 主内容区域
  *
- * 替代原 MainContentPanel，组合 TabBar + SplitContainer。
- * Settings 视图仍为独立全屏覆盖。
+ * 组合 TabBar + TabContent。设置以浮窗形式叠加显示。
  */
 
 import * as React from 'react'
-import { useAtomValue } from 'jotai'
-import { activeViewAtom } from '@/atoms/active-view'
-import { tabsAtom } from '@/atoms/tab-atoms'
+import { useAtomValue, useSetAtom } from 'jotai'
+import { tabsAtom, activeTabIdAtom } from '@/atoms/tab-atoms'
 import { Panel } from '@/components/app-shell/Panel'
-import { SettingsPanel } from '@/components/settings'
+import { SettingsDialog } from '@/components/settings'
+import { WelcomeView } from '@/components/welcome/WelcomeView'
 import { TabBar } from './TabBar'
-import { SplitContainer } from './SplitContainer'
-import { MessageSquare } from 'lucide-react'
+import { TabContent } from './TabContent'
 
 export function MainArea(): React.ReactElement {
-  const activeView = useAtomValue(activeViewAtom)
   const tabs = useAtomValue(tabsAtom)
+  const activeTabId = useAtomValue(activeTabIdAtom)
+  const setActiveTabId = useSetAtom(activeTabIdAtom)
 
-  // Settings 视图覆盖整个右侧
-  if (activeView === 'settings') {
-    return (
+  // [FLASH-DEBUG] 监控 tabs 变化，如果 tabs.length 变为 0 说明所有标签被卸载
+  React.useEffect(() => {
+    if (tabs.length === 0) {
+      console.warn('[FLASH-DEBUG] MainArea: tabs.length === 0, showing WelcomeView!', new Error().stack)
+    }
+  }, [tabs.length])
+
+  // 兜底：tabs 存在但 activeTabId 为空时，自动激活第一个标签。
+  // 正常路径（openTab/closeTab/持久化恢复）都会维护 activeTabId，此分支只为防御
+  // 异常状态（如外部原子被误清空），避免渲染 WelcomeView 触发重复 openTab 循环。
+  React.useEffect(() => {
+    if (tabs.length > 0 && !activeTabId) {
+      setActiveTabId(tabs[0]!.id)
+    }
+  }, [tabs, activeTabId, setActiveTabId])
+
+  return (
+    <>
       <Panel
         variant="grow"
-        className="bg-white/95 dark:bg-zinc-900/95 backdrop-blur-xl rounded-2xl shadow-xl border border-border/50 titlebar-no-drag"
+        className="bg-content-area/95 backdrop-blur-xl rounded-2xl shadow-xl"
       >
-        <SettingsPanel />
+        <TabBar />
+        {tabs.length === 0 ? (
+          <WelcomeView />
+        ) : activeTabId ? (
+          <div className="flex-1 min-h-0 titlebar-no-drag">
+            <TabContent tabId={activeTabId} />
+          </div>
+        ) : null}
       </Panel>
-    )
-  }
-
-  // 标签视图
-  return (
-    <Panel
-      variant="grow"
-      className="bg-white/95 dark:bg-zinc-900/95 backdrop-blur-xl rounded-2xl shadow-xl border border-border/50"
-    >
-      <TabBar />
-      {tabs.length === 0 ? (
-        <div className="flex flex-col items-center justify-center flex-1 gap-4 text-muted-foreground titlebar-no-drag" style={{ zoom: 1.1 }}>
-          <div className="w-16 h-16 rounded-full bg-muted flex items-center justify-center">
-            <MessageSquare size={32} className="text-muted-foreground/60" />
-          </div>
-          <div className="text-center space-y-2">
-            <h2 className="text-lg font-medium text-foreground">开始使用</h2>
-            <p className="text-sm max-w-[300px]">
-              从左侧选择或创建一个对话，它将以标签页的形式打开
-            </p>
-          </div>
-        </div>
-      ) : (
-        <SplitContainer />
-      )}
-    </Panel>
+      <SettingsDialog />
+    </>
   )
 }

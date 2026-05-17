@@ -4,7 +4,7 @@
  * 将 Agent 事件转换为飞书消息卡片格式。
  */
 
-import type { AgentEvent } from '@proma/shared'
+// Phase 1: AgentEvent 不再使用，保留 import 供后续清理
 
 /** 工具活动摘要 */
 export interface ToolSummary {
@@ -23,7 +23,7 @@ export interface FormattedAgentResult {
 /**
  * 构建 Agent 回复的飞书交互卡片
  */
-export function buildAgentReplyCard(result: FormattedAgentResult): Record<string, unknown> {
+export function buildAgentReplyCard(result: FormattedAgentResult, subtitle?: string): Record<string, unknown> {
   const toolLine = formatToolSummaryLine(result.toolSummaries, result.duration)
   const content = truncateForFeishu(result.text)
 
@@ -31,6 +31,7 @@ export function buildAgentReplyCard(result: FormattedAgentResult): Record<string
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: 'Proma Agent' },
+      ...(subtitle ? { subtitle: { tag: 'plain_text', content: subtitle } } : {}),
       template: 'blue',
     },
     elements: [
@@ -258,6 +259,7 @@ export function buildHelpCard(): Record<string, unknown> {
         content: [
           '`/help` — 显示帮助',
           '`/new [标题]` — 创建新 Agent 会话',
+          '`/now` — 查看当前状态（工作区、会话、MCP、Skills 等）',
           '`/chat` — 切换到 Chat 模式',
           '`/agent` — 切换到 Agent 模式',
           '`/list` — 列出所有会话',
@@ -338,27 +340,20 @@ export function splitLongContent(text: string, maxLength = 25000): string[] {
 }
 
 /**
- * 从 AgentEvent 中提取工具名称（用于累积工具摘要）
+ * 累积工具使用次数（从 SDKMessage 的 tool_use block 中提取工具名）
  */
-export function accumulateToolSummary(
+export function accumulateToolStart(
   summaries: Map<string, ToolSummary>,
-  event: AgentEvent,
+  toolName: string,
 ): void {
-  if (event.type === 'tool_start') {
-    const existing = summaries.get(event.toolName)
-    if (existing) {
-      existing.count++
-    } else {
-      summaries.set(event.toolName, {
-        toolName: event.toolName,
-        count: 1,
-        hasError: false,
-      })
-    }
-  } else if (event.type === 'tool_result' && event.isError && event.toolName) {
-    const existing = summaries.get(event.toolName)
-    if (existing) {
-      existing.hasError = true
-    }
+  const existing = summaries.get(toolName)
+  if (existing) {
+    existing.count++
+  } else {
+    summaries.set(toolName, {
+      toolName,
+      count: 1,
+      hasError: false,
+    })
   }
 }

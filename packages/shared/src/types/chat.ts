@@ -77,6 +77,8 @@ export interface ChatMessage {
   reasoning?: string
   /** 是否被用户中止 */
   stopped?: boolean
+  /** 流式生成时遇到的错误信息 */
+  error?: string
   /** 文件附件列表 */
   attachments?: FileAttachment[]
   /** 工具活动记录（assistant 消息，工具调用历史） */
@@ -126,10 +128,36 @@ export interface ConversationMeta {
   contextLength?: number | 'infinite'
   /** 是否置顶 */
   pinned?: boolean
+  /** 是否已归档 */
+  archived?: boolean
   /** 创建时间戳 */
   createdAt: number
   /** 更新时间戳 */
   updatedAt: number
+}
+
+// ===== 消息搜索 =====
+
+/**
+ * 消息搜索结果
+ */
+export interface MessageSearchResult {
+  /** 对话 ID */
+  conversationId: string
+  /** 对话标题 */
+  conversationTitle: string
+  /** 消息 ID */
+  messageId: string
+  /** 消息角色 */
+  role: MessageRole
+  /** 匹配上下文片段（约 80 字符） */
+  snippet: string
+  /** snippet 内匹配起始位置 */
+  matchStart: number
+  /** 匹配长度 */
+  matchLength: number
+  /** 是否已归档 */
+  archived?: boolean
 }
 
 // ===== 消息发送 =====
@@ -232,8 +260,10 @@ export interface ChatToolActivity {
   type: 'start' | 'result'
   /** 执行结果（仅 result 时存在） */
   result?: string
-  /** 是否出错 */
+  /** 是否遇到错误 */
   isError?: boolean
+  /** 工具调用参数（result 事件中携带，用于语义化短语和结构化结果渲染） */
+  input?: Record<string, unknown>
 }
 
 /**
@@ -324,6 +354,10 @@ export const CHAT_IPC_CHANNELS = {
   SAVE_ATTACHMENT: 'chat:save-attachment',
   /** 读取附件（返回 base64） */
   READ_ATTACHMENT: 'chat:read-attachment',
+  /** 另存图片到用户选择的位置（原生 Save As 对话框） */
+  SAVE_IMAGE_AS: 'chat:save-image-as',
+  /** 保存应用内置资源文件到用户选择的位置（原生 Save As 对话框） */
+  SAVE_RESOURCE_FILE_AS: 'chat:save-resource-file-as',
   /** 删除附件 */
   DELETE_ATTACHMENT: 'chat:delete-attachment',
   /** 打开文件选择对话框 */
@@ -334,6 +368,16 @@ export const CHAT_IPC_CHANNELS = {
   // 置顶管理
   /** 切换对话置顶状态 */
   TOGGLE_PIN: 'chat:toggle-pin',
+  /** 切换对话归档状态 */
+  TOGGLE_ARCHIVE: 'chat:toggle-archive',
+  /** 搜索对话消息内容 */
+  SEARCH_MESSAGES: 'chat:search-messages',
+
+  // 教程
+  /** 获取教程内容 */
+  GET_TUTORIAL_CONTENT: 'chat:get-tutorial-content',
+  /** 创建欢迎对话（含教程附件） */
+  CREATE_WELCOME_CONVERSATION: 'chat:create-welcome-conversation',
 
   // 流式事件（主进程 → 渲染进程推送）
   /** 内容片段 */

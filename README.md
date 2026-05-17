@@ -1,8 +1,12 @@
 # Proma
 
-> **📖 新手？从这里开始 →** [**Proma 使用教程系列**](./tutorial/tutorial-1.md) — 从零开始配置环境、连接大模型，3-5 分钟即可上手。
+<video width="560" controls>
+  <source src="https://img.erlich.fun/personal-blog/uPic/%E7%AE%80%E5%8D%95%E4%BB%8B%E7%BB%8D%20Proma.mp4" type="video/mp4">
+</video>
 
-下一代集成通用 Agent 的 AI 桌面应用，支持对话、Agent、Agent Teams 等能力，本地优先、多供应商支持、完全开源。支持远程通过飞书机器人与 Agent 对话和交互，让你用手机也可以处理很多必要的工作。
+> **📖 新手？从这里开始 →** [**Proma 使用教程系列(点击此处)**](./tutorial/tutorial.md) — 从零开始配置环境、连接大模型，3-5 分钟即可上手。
+
+下一代集成通用 Agent 的 AI 桌面应用，支持对话、Agent、Agent Teams **等能力**，本地优先、多供应商支持、完全开源。支持远程通过飞书机器人与 Agent 对话和交互，甚至把 Proma Agent 拉进群组替你完成工作，跟同事实现 Agent 协作，让你用手机也可以处理很多必要的工作。
 
 [English version README.md](./README.en.md)
 
@@ -40,8 +44,10 @@ Proma Skills 和 MCP，默认内置 Brainstorming 和办公软件 Skill，支持
 
 ![Proma Default Skills and Mcp](https://img.erlich.fun/personal-blog/uPic/PNBOSt.png)
 
-### 通过飞书远程使用 Proma
+### 通过飞书远程使用 Proma / 支持私聊和群组
 Proma 支持通过使用飞书机器人的方式来远程使用 Proma Agent 能力，支持切换工作区（/workspace 命令），支持创建新会话（/new 命令），这样就可以实现类似截图中的效果，可以为不同的工作区先配置上（或直接通过 Proma Agent 来帮你配置）对应的 Skills / MCP 以及文件附录等资源，即可远程也能让 Proma Agent 帮你完成工作。譬如远程帮你进行调研，并将调研文件通过邮件或其他方式发送到同事的邮箱、远程合并 PR 或者修复紧急的 Bug 并推送上线等。
+
+也支持将 Proma Agent 拉进你的飞书群组，可以跟同事共享你积攒下来的 Skills 和 MCP 能力，利用本地的文件和飞书文档一起完成更智能的 Agent 协作，甚至可以直接用 Proma Agent 来完成对外部用户的服务。
 
 ![Proma Lark Demo](https://img.erlich.fun/personal-blog/uPic/nNu4wA.png)
 
@@ -66,15 +72,18 @@ Proma 全协议大模型渠道支持，支持国内外所有渠道模型，通�
 
 ## 特性
 
-- **多供应商支持** — Anthropic、OpenAI、Google、DeepSeek、MiniMax、Kimi、智谱 GLM，以及任何 OpenAI 兼容端点
-- **AI Agent 模式** — 基于 Claude Agent SDK 的自主通用 Agent
-- **远程全天候使用 Proma** - 基于飞书/Lark 的机器人能力，实现远程使用 Proma Agent，搭配工作区的 Skill 和 MCP 等可以实现更好的远程工作
+- **多供应商支持** — Anthropic、OpenAI、Google、DeepSeek、Moonshot、智谱 GLM、MiniMax、豆包、通义千问，以及任何 OpenAI 兼容端点
+- **AI Agent 模式** — 基于 Claude Agent SDK 0.2.84 的自主通用 Agent，支持工作区隔离和权限管理
+- **Agent Teams** — 多 Agent 协同工作，自动组建团队处理复杂任务，提升 5-20% 效果
+- **远程全天候使用 Proma** — 基于飞书/Lark 的机器人能力，实现远程使用 Proma Agent，支持私聊和群组，搭配工作区的 Skill 和 MCP 实现远程工作
+- **Skills & MCP** — 可扩展工具链，默认内置 Brainstorming 和办公软件 Skill，支持通过对话自动寻找和安装 Skills
 - **流式输出 & 思考模式** — 实时流式响应，可视化扩展思考过程
-- **丰富渲染** — Mermaid 图表、语法高亮代码块、Markdown
+- **丰富渲染** — Mermaid 图表、语法高亮代码块、Markdown、数学公式（KaTeX）
 - **附件 & 文档解析** — 上传图片，解析 PDF/Office/文本文件内容到对话中
 - **记忆功能** — Chat 和 Agent 共享记忆，AI 记住你的偏好、习惯和上下文，跨会话持续理解你
-- **本地优先** — 所有数据存储在 `~/.proma/`，无数据库，完全可移植
+- **本地优先** — 所有数据存储在 `~/.proma/`，JSON + JSONL 格式，无数据库，完全可移植
 - **主题切换** — 亮色/暗色模式，跟随系统偏好
+- **自动更新** — 内置 Electron Updater，自动检测和安装更新
 
 ## 快速开始
 
@@ -104,12 +113,19 @@ MiniMax、Kimi（Moonshot）和智谱 GLM 使用专用 API 端点 — 选择供�
 
 ## 技术栈
 
-- **运行时** — Bun
-- **框架** — Electron + React 18
-- **状态管理** — Jotai
-- **样式** — Tailwind CSS + shadcn/ui
-- **构建** — Vite（渲染进程）+ esbuild（主进程/预加载）
-- **语言** — TypeScript
+- **运行时** — Bun 1.2.5+
+- **桌面框架** — Electron 39.5.1
+- **前端框架** — React 18.3.1
+- **状态管理** — Jotai 2.17.1
+- **UI 组件** — Radix UI
+- **样式** — Tailwind CSS 3.4.17
+- **富文本编辑器** — TipTap 3.19.0
+- **代码高亮** — Shiki 3.22.0
+- **构建工具** — Vite 6.0.3（渲染进程）+ esbuild 0.24.0+（主进程/预加载）
+- **打包工具** — Electron Builder 25.1.8
+- **语言** — TypeScript 5.0.0+
+- **Agent SDK** — @anthropic-ai/claude-agent-sdk 0.2.84
+- **飞书 SDK** — @larksuiteoapi/node-sdk
 
 ## 致谢
 

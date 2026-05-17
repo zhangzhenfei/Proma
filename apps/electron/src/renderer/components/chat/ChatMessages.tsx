@@ -13,8 +13,9 @@
  */
 
 import * as React from 'react'
-import { useAtomValue } from 'jotai'
-import { MessageSquare, Loader2 } from 'lucide-react'
+import { useAtomValue, useSetAtom } from 'jotai'
+import { Loader2 } from 'lucide-react'
+import { WelcomeEmptyState } from '@/components/welcome/WelcomeEmptyState'
 import { ChatMessageItem, formatMessageTime } from './ChatMessageItem'
 import type { InlineEditSubmitPayload } from './ChatMessageItem'
 import { ChatToolActivityIndicator } from './ChatToolActivityIndicator'
@@ -42,9 +43,11 @@ import {
   ReasoningContent,
 } from '@/components/ai-elements/reasoning'
 import { useSmoothStream } from '@proma/ui'
+import { ScrollPositionManager } from '@/hooks/useScrollPositionMemory'
 import { useConversationParallelMode } from '@/hooks/useConversationSettings'
 import { getModelLogo } from '@/lib/model-logo'
 import { userProfileAtom } from '@/atoms/user-profile'
+import { tabMinimapCacheAtom } from '@/atoms/tab-atoms'
 import type { ChatMessage, ChatToolActivity } from '@proma/shared'
 
 // ===== 滚动到顶部加载更多 =====
@@ -117,6 +120,8 @@ interface ChatMessagesProps {
   conversationId: string
   /** 消息列表 */
   messages: ChatMessage[]
+  /** 消息是否已完成首次 IPC 加载 */
+  messagesLoaded: boolean
   /** 是否正在流式生成 */
   streaming: boolean
   /** 流式累积内容 */
@@ -125,6 +130,8 @@ interface ChatMessagesProps {
   streamingReasoning: string
   /** 流式消息绑定的模型 */
   streamingModel: string | null
+  /** 流式开始时间戳 */
+  startedAt?: number
   /** 工具活动列表 */
   toolActivities: ChatToolActivity[]
   /** 上下文分隔线 */
@@ -149,27 +156,20 @@ interface ChatMessagesProps {
   onLoadMore?: () => Promise<void>
 }
 
-/** 空状态引导 */
+/** 空状态引导 — 使用 WelcomeEmptyState */
 function EmptyState(): React.ReactElement {
-  return (
-    <div className="flex h-full items-center justify-center">
-      <div className="flex flex-col items-center gap-3 text-muted-foreground">
-        <div className="w-12 h-12 rounded-full bg-muted flex items-center justify-center">
-          <MessageSquare size={24} className="text-muted-foreground/60" />
-        </div>
-        <p className="text-sm">在下方输入框开始对话</p>
-      </div>
-    </div>
-  )
+  return <WelcomeEmptyState />
 }
 
 export function ChatMessages({
   conversationId,
   messages,
+  messagesLoaded,
   streaming,
   streamingContent,
   streamingReasoning,
   streamingModel,
+  startedAt,
   toolActivities,
   contextDividers,
   hasMore,
@@ -183,20 +183,46 @@ export function ChatMessages({
   onLoadMore,
 }: ChatMessagesProps): React.ReactElement {
   const userProfile = useAtomValue(userProfileAtom)
+  const setMinimapCache = useSetAtom(tabMinimapCacheAtom)
 
   // 平滑流式输出：将高频更新转为逐字渲染
-  const { displayedContent: smoothContent } = useSmoothStream({
+  const { displayedContent: rawSmoothContent } = useSmoothStream({
     content: streamingContent,
     isStreaming: streaming,
   })
-  const { displayedContent: smoothReasoning } = useSmoothStream({
+  const { displayedContent: rawSmoothReasoning } = useSmoothStream({
     content: streamingReasoning,
     isStreaming: streaming,
   })
+
+  // 防闪屏守卫：useSmoothStream 的内部状态通过 useEffect 更新，比 props 晚一帧。
+  // 当流式状态被清除（streamingContent 变为 ''）但 smoothContent 仍持有旧值时，
+  // 会导致持久化消息和流式气泡同时渲染一帧（重复内容闪烁）。
+  // 这里用原始 streamingContent 作为守卫：如果原始内容已清空且不在流式中，立即归零。
+  const smoothContent = (streaming || streamingContent) ? rawSmoothContent : ''
+  const smoothReasoning = (streaming || streamingReasoning) ? rawSmoothReasoning : ''
   const [parallelMode] = useConversationParallelMode()
 
   /** 是否正在加载更多历史 */
   const [loadingMore, setLoadingMore] = React.useState(false)
+
+  /**
+   * 流式完成过渡：streaming 结束到持久化消息加载完成之间，
+   * 强制 resize="instant" 避免中间高度变化触发平滑滚动动画。
+   */
+  const [transitioning, setTransitioning] = React.useState(false)
+  React.useEffect(() => {
+    if (streaming) {
+      setTransitioning(false)
+      return
+    }
+    if (streamingContent || smoothContent) {
+      setTransitioning(true)
+      return
+    }
+    const timer = setTimeout(() => setTransitioning(false), 150)
+    return () => clearTimeout(timer)
+  }, [streaming, streamingContent, smoothContent])
 
   /**
    * 淡入控制：切换对话时先隐藏，等 StickToBottom 定位完成后再显示。
@@ -217,7 +243,10 @@ export function ChatMessages({
   React.useEffect(() => {
     if (ready) return
 
-    // 空对话直接显示
+    // 必须等消息 IPC 加载完成，否则 messages=[] 会被误判为空对话
+    if (!messagesLoaded) return
+
+    // 加载完后确实是空对话：直接显示
     if (messages.length === 0 && !streaming) {
       setReady(true)
       return
@@ -231,7 +260,7 @@ export function ChatMessages({
       })
     })
     return () => { cancelled = true }
-  }, [messages, streaming, ready])
+  }, [messages, streaming, ready, messagesLoaded])
 
   /** 加载更多历史消息 */
   const handleLoadMore = React.useCallback(async () => {
@@ -254,21 +283,34 @@ export function ChatMessages({
     () => messages.map((m) => ({
       id: m.id,
       role: m.role as MinimapItem['role'],
-      preview: m.content.slice(0, 80),
+      preview: m.content.slice(0, 200),
       avatar: m.role === 'user' ? userProfile.avatar : undefined,
       model: m.model,
     })),
     [messages, userProfile.avatar]
   )
 
+  // 同步 minimap 缓存到 Tab 级别（供 Tab hover 预览使用）
+  React.useEffect(() => {
+    if (minimapItems.length > 0) {
+      setMinimapCache((prev) => {
+        const next = new Map(prev)
+        next.set(conversationId, minimapItems)
+        return next
+      })
+    }
+  }, [conversationId, minimapItems, setMinimapCache])
+
   // 并排模式
   if (parallelMode) {
     return (
       <ParallelChatMessages
         messages={messages}
+        conversationId={conversationId}
         streaming={streaming}
         streamingContent={smoothContent}
         streamingReasoning={smoothReasoning}
+        startedAt={startedAt}
         contextDividers={contextDividers}
         onDeleteDivider={onDeleteDivider}
         onDeleteMessage={onDeleteMessage}
@@ -286,7 +328,8 @@ export function ChatMessages({
   const dividerSet = new Set(contextDividers)
 
   return (
-    <Conversation className={ready ? 'opacity-100 transition-opacity duration-200' : 'opacity-0'}>
+    <Conversation resize={ready && !transitioning ? 'smooth' : 'instant'} className={ready ? 'opacity-100 transition-opacity duration-200' : 'opacity-0'}>
+      <ScrollPositionManager id={conversationId} ready={ready} />
       {/* 滚动到顶部时自动加载更多历史 */}
       <ScrollTopLoader
         hasMore={hasMore}
@@ -304,6 +347,7 @@ export function ChatMessages({
                 <div data-message-id={msg.id}>
                   <ChatMessageItem
                     message={msg}
+                    conversationId={conversationId}
                     isStreaming={false}
                     isLastAssistant={false}
                     allMessages={messages}
@@ -341,7 +385,7 @@ export function ChatMessages({
                 />
                 <MessageContent>
                   {/* 工具活动指示器 */}
-                  <ChatToolActivityIndicator activities={toolActivities} />
+                  <ChatToolActivityIndicator activities={toolActivities} isStreaming={streaming} />
 
                   {/* 推理内容（如果有） */}
                   {smoothReasoning && (
@@ -362,7 +406,7 @@ export function ChatMessages({
                     </>
                   ) : (
                     /* 等待首个 chunk 时的加载动画（仅流式中且无推理时显示） */
-                    streaming && !smoothReasoning && <MessageLoading />
+                    streaming && !smoothReasoning && <MessageLoading startedAt={startedAt} />
                   )}
                 </MessageContent>
               </Message>

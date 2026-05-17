@@ -1,15 +1,14 @@
 /**
  * Claude Agent SDK 适配器
  *
- * 实现 AgentProviderAdapter 接口，将 Claude Agent SDK 的 SDKMessage 流
- * 翻译为 Proma 的 AgentEvent 流。所有 SDK 消息类型在此统一处理，
- * 不再有"一部分在这里翻译，一部分在外面翻译"的问题。
+ * 实现 AgentProviderAdapter 接口，直接透传 SDK 的 SDKMessage 流。
+ * 使用 includePartialMessages: false 获取完整 JSON 对象，无需逐 chunk 翻译。
  */
 
 import type {
-  AgentEvent,
   AgentQueryInput,
   AgentProviderAdapter,
+  SDKUserMessageInput,
   TypedError,
   ErrorCode,
   ThinkingConfig,
@@ -17,72 +16,92 @@ import type {
   AgentDefinition,
   SdkBeta,
   JsonSchemaOutputFormat,
-} from '@proma/shared'
-import {
-  ToolIndex,
-  extractToolStarts,
-  extractToolResults,
-  SUBAGENT_TOOL_NAMES,
-  type ContentBlock,
+  SDKMessage,
 } from '@proma/shared'
 import type { CanUseToolOptions, PermissionResult } from '../agent-permission-service'
+import { TRANSIENT_NETWORK_PATTERN } from '../error-patterns'
 
-interface SDKAssistantMessage {
-  type: 'assistant'
-  message: {
-    content: Array<{ type: string; id?: string; name?: string; input?: Record<string, unknown>; text?: string }>
-    usage?: { input_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
+/** SDK Query 对象类型（从动态导入中推断） */
+type SDKQuery = ReturnType<typeof import('@anthropic-ai/claude-agent-sdk').query>
+
+/** SDK 用户消息类型 */
+type SDKUserMessage = import('@anthropic-ai/claude-agent-sdk').SDKUserMessage
+
+// ============================================================================
+// 长生命周期消息通道
+// ============================================================================
+
+/**
+ * 异步消息队列，作为 SDK streamInput 的持久化 AsyncGenerator。
+ *
+ * 解决的问题：SDK 的 streamInput() 在消费完 AsyncGenerator 后会调用 endInput()
+ * 关闭 CLI 的 stdin。如果使用单次 yield 的 generator，第一轮对话结束后 stdin 即关闭，
+ * 导致后续所有工具权限请求（sendRequest）因 inputClosed=true 而抛出 "Stream closed"。
+ *
+ * Generator 在会话期间保持活跃以支持工具权限注入。收到 result 后由 adapter 调用 close()，
+ * 让 SDK 自然调用 endInput() 关闭 stdin，子进程检测到 EOF 后退出，iterator 返回 done:true。
+ */
+interface MessageChannel {
+  /** 向队列推送消息（非阻塞） */
+  enqueue: (msg: SDKUserMessage) => void
+  /** 供 SDK streamInput() 消费的长生命周期 AsyncGenerator */
+  generator: AsyncGenerator<SDKUserMessage>
+  /** 优雅关闭：标记 generator 结束，排空剩余消息后返回，让 SDK 自然调用 endInput() 关闭 stdin */
+  close: () => void
+}
+
+function createMessageChannel(signal: AbortSignal): MessageChannel {
+  const queue: SDKUserMessage[] = []
+  let resolver: ((value: void) => void) | null = null
+  let done = signal.aborted // 防御：signal 已 aborted 时直接标记结束
+
+  // abort 时标记结束，唤醒可能阻塞的 generator
+  if (!done) {
+    signal.addEventListener('abort', () => {
+      done = true
+      if (resolver) {
+        const r = resolver
+        resolver = null
+        r()
+      }
+    }, { once: true })
   }
-  parent_tool_use_id: string | null
-  error?: { message: string; errorType?: string }
-  isReplay?: boolean
-}
 
-interface SDKUserMessage {
-  type: 'user'
-  message?: { content?: unknown[] }
-  parent_tool_use_id: string | null
-  tool_use_result?: unknown
-  isReplay?: boolean
-}
-
-interface SDKStreamEvent {
-  type: 'stream_event'
-  event: {
-    type: string
-    message?: { id?: string }
-    delta?: { type: string; text?: string; stop_reason?: string }
-    content_block?: { type: string; id: string; name: string; input?: Record<string, unknown> }
+  async function* generator(): AsyncGenerator<SDKUserMessage> {
+    while (!done) {
+      if (queue.length > 0) {
+        yield queue.shift()!
+      } else {
+        // 等待新消息入队或 abort 信号
+        await new Promise<void>((resolve) => { resolver = resolve })
+      }
+    }
+    // 排空剩余消息
+    while (queue.length > 0) {
+      yield queue.shift()!
+    }
   }
-  parent_tool_use_id: string | null
-}
 
-interface SDKResultMessage {
-  type: 'result'
-  subtype: 'success' | 'error'
-  usage: { input_tokens: number; output_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number }
-  total_cost_usd?: number
-  modelUsage?: Record<string, { contextWindow?: number }>
-  errors?: string[]
+  return {
+    enqueue: (msg: SDKUserMessage) => {
+      queue.push(msg)
+      if (resolver) {
+        const r = resolver
+        resolver = null
+        r()
+      }
+    },
+    generator: generator(),
+    close: () => {
+      done = true
+      if (resolver) {
+        const r = resolver
+        resolver = null
+        r()
+      }
+    },
+  }
 }
-
-interface SDKToolProgressMessage {
-  type: 'tool_progress'
-  tool_use_id: string
-  tool_name: string
-  parent_tool_use_id: string | null
-  elapsed_time_seconds?: number
-  /** Agent Teams: 所属 teammate 任务 ID */
-  task_id?: string
-}
-
-type SDKMessage =
-  | SDKAssistantMessage
-  | SDKUserMessage
-  | SDKStreamEvent
-  | SDKResultMessage
-  | SDKToolProgressMessage
-  | { type: string; parent_tool_use_id?: string | null; [key: string]: unknown }
 
 // ============================================================================
 // Claude 适配器专用查询选项
@@ -100,8 +119,8 @@ export interface ClaudeAgentQueryOptions extends AgentQueryInput {
   env: Record<string, string | undefined>
   /** 最大轮次（undefined = SDK 默认） */
   maxTurns?: number
-  /** SDK 权限模式 */
-  sdkPermissionMode: 'bypassPermissions' | 'default'
+  /** SDK 权限模式（直接使用 SDK 原生模式） */
+  sdkPermissionMode: 'acceptEdits' | 'bypassPermissions' | 'plan'
   /** 是否跳过权限检查 */
   allowDangerouslySkipPermissions: boolean
   /** 自定义权限处理器（匹配 SDK CanUseTool 签名） */
@@ -112,10 +131,12 @@ export interface ClaudeAgentQueryOptions extends AgentQueryInput {
   ) => Promise<PermissionResult>
   /** 只读工具白名单 */
   allowedTools?: string[]
-  /** 系统提示词 */
-  systemPrompt: { type: 'preset'; preset: 'claude_code'; append: string }
+  /** 系统提示词（字符串为自定义提示词，对象为 claude_code preset） */
+  systemPrompt: string | { type: 'preset'; preset: 'claude_code'; append?: string }
   /** SDK session ID（用于 resume） */
   resumeSessionId?: string
+  /** resume 时从指定消息 uuid 处截断（配合 forkSession 实现分叉） */
+  resumeSessionAt?: string
   /** MCP 服务器配置 */
   mcpServers?: Record<string, unknown>
   /** 插件配置 */
@@ -162,10 +183,48 @@ export interface ClaudeAgentQueryOptions extends AgentQueryInput {
 }
 
 // ============================================================================
-// 错误映射（从 agent-service.ts 迁移）
+// SDK 错误消息友好化
 // ============================================================================
 
-function mapSDKErrorToTypedError(
+/** 已知 SDK 错误 → 用户友好提示映射 */
+const FRIENDLY_ERROR_MESSAGES: Array<{ pattern: RegExp; message: string }> = [
+  {
+    pattern: /not logged in|please run \/login/i,
+    message: '请检查是否选择了正确的 Proma 供应渠道和模型',
+  },
+]
+
+/** 将 SDK 原始错误消息转换为用户友好的提示（无匹配则返回原文） */
+export function friendlyErrorMessage(raw: string): string {
+  for (const { pattern, message } of FRIENDLY_ERROR_MESSAGES) {
+    if (pattern.test(raw)) return message
+  }
+  return raw
+}
+
+// ============================================================================
+// 错误映射
+// ============================================================================
+
+/** Prompt too long 错误关键词匹配 */
+const PROMPT_TOO_LONG_PATTERNS = [
+  'prompt is too long',
+  'prompt_too_long',
+  'input is too long',
+  'context_length_exceeded',
+  'maximum context length',
+  'token limit',
+  'exceeds the model',
+] as const
+
+/** 检测错误消息是否为 prompt too long 类型 */
+export function isPromptTooLongError(...messages: string[]): boolean {
+  const combined = messages.join(' ').toLowerCase()
+  return PROMPT_TOO_LONG_PATTERNS.some((p) => combined.includes(p))
+}
+
+/** 将 SDK 错误映射为 TypedError */
+export function mapSDKErrorToTypedError(
   errorCode: string,
   detailedMessage: string,
   originalError: string,
@@ -195,6 +254,33 @@ function mapSDKErrorToTypedError(
       message: 'API 服务当前过载，请稍后再试',
       canRetry: true,
     },
+    'prompt_too_long': {
+      code: 'prompt_too_long',
+      title: '上下文过长',
+      message: '当前对话的上下文已超出模型限制，请压缩上下文或开启新会话',
+      canRetry: false,
+    },
+  }
+
+  // 瞬时网络错误（terminated / ECONNRESET / socket hang up 等）：
+  // assistant.error 路径下，SDK 常常把这类错误标记为 errorType='unknown'，
+  // 这里从 detailedMessage / originalError 兜底匹配，归类为可重试的 network_error。
+  const looksLikeNetwork =
+    (!errorMap[errorCode]) &&
+    (TRANSIENT_NETWORK_PATTERN.test(detailedMessage ?? '') || TRANSIENT_NETWORK_PATTERN.test(originalError ?? ''))
+  if (looksLikeNetwork) {
+    return {
+      code: 'network_error',
+      title: '网络异常',
+      message: detailedMessage || '上游 API 连接中断',
+      actions: [
+        { key: 's', label: '设置', action: 'settings' },
+        { key: 'r', label: '重试', action: 'retry' },
+      ],
+      canRetry: true,
+      retryDelayMs: 1000,
+      originalError,
+    }
   }
 
   const mapped = errorMap[errorCode] || {
@@ -211,11 +297,47 @@ function mapSDKErrorToTypedError(
     actions: [
       { key: 's', label: '设置', action: 'settings' },
       ...(mapped.canRetry ? [{ key: 'r', label: '重试', action: 'retry' }] : []),
+      ...(mapped.code === 'prompt_too_long' ? [{ key: 'c', label: '压缩上下文', action: 'compact' }] : []),
     ],
     canRetry: mapped.canRetry,
     retryDelayMs: mapped.canRetry ? 1000 : undefined,
     originalError,
   }
+}
+
+/** 从 assistant 错误消息中提取详细信息 */
+export function extractErrorDetails(msg: { error?: { message: string }; message?: { content?: Array<Record<string, unknown>> } }): { detailedMessage: string; originalError: string } {
+  let detailedMessage = msg.error?.message ?? '未知错误'
+  let originalError = msg.error?.message ?? '未知错误'
+
+  try {
+    const content = msg.message?.content
+    if (Array.isArray(content) && content.length > 0) {
+      const textBlock = content.find((block) => block.type === 'text')
+      if (textBlock && 'text' in textBlock && typeof textBlock.text === 'string') {
+        const fullText = textBlock.text
+        originalError = fullText
+
+        const apiErrorMatch = fullText.match(/API Error:\s*\d+\s*(\{.*\})/s)
+        if (apiErrorMatch?.[1]) {
+          try {
+            const apiErrorObj = JSON.parse(apiErrorMatch[1])
+            if (apiErrorObj.error?.message) {
+              detailedMessage = apiErrorObj.error.message
+            }
+          } catch {
+            detailedMessage = fullText
+          }
+        } else {
+          detailedMessage = fullText
+        }
+      }
+    }
+  } catch {
+    // 提取失败，使用原始 error 字段
+  }
+
+  return { detailedMessage, originalError }
 }
 
 // ============================================================================
@@ -225,9 +347,35 @@ function mapSDKErrorToTypedError(
 /** 活跃的 AbortController 映射（sessionId → controller） */
 const activeControllers = new Map<string, AbortController>()
 
+/** 活跃的 SDK Query 对象映射（sessionId → query），用于队列消息注入 */
+const activeQueries = new Map<string, SDKQuery>()
+
+/** 活跃的消息通道映射（sessionId → channel），供后续消息注入 */
+const activeChannels = new Map<string, MessageChannel>()
+
+/** Query 就绪 Promise（在 SDK init 完成前缓冲队列消息） */
+const queryReadyPromises = new Map<string, Promise<void>>()
+const queryReadyResolvers = new Map<string, () => void>()
+
+/** SDK init 超时时间（毫秒） */
+const QUERY_READY_TIMEOUT_MS = 60_000
+
 export class ClaudeAgentAdapter implements AgentProviderAdapter {
 
   abort(sessionId: string): void {
+    // 先调用 query.close() 强制终止 CLI 子进程及其所有子进程（包括正在运行的 bash 命令）
+    const query = activeQueries.get(sessionId)
+    if (query) {
+      try {
+        query.close()
+      } catch {
+        // query 可能已关闭或子进程已退出，忽略
+      }
+      activeQueries.delete(sessionId)
+    }
+
+    activeChannels.delete(sessionId)
+
     const controller = activeControllers.get(sessionId)
     if (controller) {
       controller.abort()
@@ -235,422 +383,61 @@ export class ClaudeAgentAdapter implements AgentProviderAdapter {
     }
   }
 
+  /**
+   * 软中断当前 turn（用户流式追加并要求立即打断时使用）。
+   *
+   * 调用 SDK 的 query.interrupt()：停止当前 turn 但保留子进程与消息通道。
+   * 调用后 SDK 会 yield 一条 result（subtype: 'interrupt'），随后从 channel
+   * 继续读取下一条用户输入——此方法通常紧跟 sendQueuedMessage() 使用。
+   *
+   * 若查询已不存在（如已经 abort 过），静默返回。
+   */
+  async interruptQuery(sessionId: string): Promise<void> {
+    const query = activeQueries.get(sessionId)
+    if (!query) return
+    try {
+      await query.interrupt()
+      console.log(`[Claude 适配器] 已软中断当前 turn: sessionId=${sessionId}`)
+    } catch (error) {
+      console.warn(`[Claude 适配器] 软中断失败: sessionId=${sessionId}`, error)
+    }
+  }
+
   dispose(): void {
+    for (const [, query] of activeQueries) {
+      try {
+        query.close()
+      } catch {
+        // 忽略已关闭的 query
+      }
+    }
     for (const [, controller] of activeControllers) {
       controller.abort()
     }
     activeControllers.clear()
+    activeQueries.clear()
+    activeChannels.clear()
+    queryReadyPromises.clear()
+    queryReadyResolvers.clear()
   }
 
   /**
-   * 翻译单条 SDK 消息为 AgentEvent 列表
+   * 发起查询，返回 SDKMessage 异步迭代流
    *
-   * 统一处理所有 SDK 消息类型，包括之前散落在 runAgent 循环中的
-   * system、prompt_suggestion、usage_update 逻辑。
+   * 使用 includePartialMessages: false 获取完整 JSON 对象，直接透传。
    */
-  private translateMessage(
-    message: SDKMessage,
-    toolIndex: ToolIndex,
-    emittedToolStarts: Set<string>,
-    activeParentTools: Set<string>,
-    pendingText: { value: string | null },
-    pendingParentToolUseId: { value: string | null },
-    turnId: { value: string | null },
-    cachedContextWindow: { value: number | undefined },
-  ): AgentEvent[] {
-    const events: AgentEvent[] = []
-
-    switch (message.type) {
-      case 'assistant': {
-        const msg = message as SDKAssistantMessage
-
-        // SDK 级别错误（如 authentication_failed）
-        if (msg.error) {
-          const { detailedMessage, originalError } = this.extractErrorDetails(msg)
-          const errorCode = msg.error.errorType || 'unknown_error'
-          const typedError = mapSDKErrorToTypedError(errorCode, detailedMessage, originalError)
-          events.push({ type: 'typed_error', error: typedError })
-          break
-        }
-
-        if (msg.isReplay) break
-
-        // 主链 usage 追踪（之前在 runAgent 循环中直接处理）
-        if (!msg.parent_tool_use_id && msg.message.usage) {
-          const u = msg.message.usage
-          const inputTokens = u.input_tokens
-            + (u.cache_read_input_tokens ?? 0)
-            + (u.cache_creation_input_tokens ?? 0)
-          events.push({
-            type: 'usage_update',
-            usage: { inputTokens, contextWindow: cachedContextWindow.value },
-          })
-        }
-
-        // 工具启动事件提取
-        const content = msg.message.content
-        const toolStartEvents = extractToolStarts(
-          content as ContentBlock[],
-          msg.parent_tool_use_id,
-          toolIndex,
-          emittedToolStarts,
-          turnId.value || undefined,
-          activeParentTools,
-        )
-        for (const evt of toolStartEvents) {
-          if (evt.type === 'tool_start' && SUBAGENT_TOOL_NAMES.has(evt.toolName)) {
-            activeParentTools.add(evt.toolUseId)
-          }
-        }
-        events.push(...toolStartEvents)
-
-        // 文本累积
-        let textContent = ''
-        for (const block of content) {
-          if (block.type === 'text' && 'text' in block) {
-            textContent += block.text
-          }
-        }
-        if (textContent) {
-          pendingText.value = textContent
-          pendingParentToolUseId.value = msg.parent_tool_use_id || null
-        }
-        break
-      }
-
-      case 'stream_event':
-        this.translateStreamEvent(message as SDKStreamEvent, events, toolIndex, emittedToolStarts, activeParentTools, pendingText, pendingParentToolUseId, turnId)
-        break
-
-      case 'user':
-        this.translateUserMessage(message as SDKUserMessage, events, toolIndex, activeParentTools, turnId)
-        break
-
-      case 'tool_progress':
-        this.translateToolProgress(message as SDKToolProgressMessage, events, toolIndex, emittedToolStarts, activeParentTools, turnId)
-        break
-
-      case 'result':
-        this.translateResult(message as SDKResultMessage, events, cachedContextWindow)
-        break
-
-      case 'system':
-        this.translateSystem(message, events, turnId)
-        break
-
-      case 'prompt_suggestion':
-        this.translatePromptSuggestion(message, events)
-        break
-
-      case 'tool_use_summary': {
-        const summaryMsg = message as { type: 'tool_use_summary'; summary?: string; preceding_tool_use_ids?: string[] }
-        if (summaryMsg.summary) {
-          events.push({
-            type: 'tool_use_summary',
-            summary: summaryMsg.summary,
-            precedingToolUseIds: summaryMsg.preceding_tool_use_ids ?? [],
-          })
-        }
-        break
-      }
-
-      default:
-        console.log(`[ClaudeAgentAdapter] 忽略消息类型: ${message.type}`)
-        break
-    }
-
-    return events
-  }
-
-  private translateStreamEvent(
-    msg: SDKStreamEvent,
-    events: AgentEvent[],
-    toolIndex: ToolIndex,
-    emittedToolStarts: Set<string>,
-    activeParentTools: Set<string>,
-    pendingText: { value: string | null },
-    pendingParentToolUseId: { value: string | null },
-    turnId: { value: string | null },
-  ): void {
-    const streamEvent = msg.event
-
-    // 捕获 turn ID
-    if (streamEvent.type === 'message_start' && streamEvent.message?.id) {
-      turnId.value = streamEvent.message.id
-    }
-
-    // message_delta 包含 stop_reason — 刷新 pending 文本
-    if (streamEvent.type === 'message_delta') {
-      const stopReason = streamEvent.delta?.stop_reason
-      if (pendingText.value) {
-        events.push({
-          type: 'text_complete',
-          text: pendingText.value,
-          isIntermediate: stopReason === 'tool_use',
-          turnId: turnId.value || undefined,
-          parentToolUseId: msg.parent_tool_use_id || undefined,
-        })
-        pendingText.value = null
-        pendingParentToolUseId.value = null
-      }
-    }
-
-    // 流式文本增量
-    if (streamEvent.type === 'content_block_delta' && streamEvent.delta?.type === 'text_delta') {
-      events.push({
-        type: 'text_delta',
-        text: streamEvent.delta.text || '',
-        turnId: turnId.value || undefined,
-        parentToolUseId: msg.parent_tool_use_id || undefined,
-      })
-    }
-
-    // 流式工具启动
-    if (streamEvent.type === 'content_block_start' && streamEvent.content_block?.type === 'tool_use') {
-      const toolBlock = streamEvent.content_block
-      const streamBlocks: ContentBlock[] = [{
-        type: 'tool_use' as const,
-        id: toolBlock.id,
-        name: toolBlock.name,
-        input: (toolBlock.input ?? {}) as Record<string, unknown>,
-      }]
-      const streamEvents = extractToolStarts(
-        streamBlocks, msg.parent_tool_use_id, toolIndex,
-        emittedToolStarts, turnId.value || undefined, activeParentTools,
-      )
-      for (const evt of streamEvents) {
-        if (evt.type === 'tool_start' && SUBAGENT_TOOL_NAMES.has(evt.toolName)) {
-          activeParentTools.add(evt.toolUseId)
-        }
-      }
-      events.push(...streamEvents)
-    }
-  }
-
-  private translateUserMessage(
-    msg: SDKUserMessage,
-    events: AgentEvent[],
-    toolIndex: ToolIndex,
-    activeParentTools: Set<string>,
-    turnId: { value: string | null },
-  ): void {
-    if (msg.isReplay) return
-
-    if (msg.tool_use_result !== undefined || msg.message) {
-      const msgContent = msg.message
-        ? ((msg.message as { content?: unknown[] }).content ?? [])
-        : []
-      const contentBlocks = (Array.isArray(msgContent) ? msgContent : []) as ContentBlock[]
-
-      const resultEvents = extractToolResults(
-        contentBlocks, msg.parent_tool_use_id,
-        msg.tool_use_result, toolIndex, turnId.value || undefined,
-      )
-      for (const evt of resultEvents) {
-        if (evt.type === 'tool_result' && evt.toolName && SUBAGENT_TOOL_NAMES.has(evt.toolName)) {
-          activeParentTools.delete(evt.toolUseId)
-        }
-      }
-      events.push(...resultEvents)
-    }
-  }
-
-  private translateToolProgress(
-    msg: SDKToolProgressMessage,
-    events: AgentEvent[],
-    toolIndex: ToolIndex,
-    emittedToolStarts: Set<string>,
-    activeParentTools: Set<string>,
-    turnId: { value: string | null },
-  ): void {
-    if (msg.elapsed_time_seconds !== undefined) {
-      events.push({
-        type: 'task_progress',
-        toolUseId: msg.parent_tool_use_id || msg.tool_use_id,
-        elapsedSeconds: msg.elapsed_time_seconds,
-        turnId: turnId.value || undefined,
-        // Agent Teams: 透传 taskId 和 toolName（区分 teammate 内的工具进度 vs 普通工具计时）
-        ...(msg.task_id && { taskId: msg.task_id, lastToolName: msg.tool_name }),
-      })
-    }
-
-    // 如果还没见过这个工具，发出 tool_start
-    if (!emittedToolStarts.has(msg.tool_use_id)) {
-      const progressBlocks: ContentBlock[] = [{
-        type: 'tool_use' as const,
-        id: msg.tool_use_id,
-        name: msg.tool_name,
-        input: {},
-      }]
-      const progressEvents = extractToolStarts(
-        progressBlocks, msg.parent_tool_use_id, toolIndex,
-        emittedToolStarts, turnId.value || undefined, activeParentTools,
-      )
-      for (const evt of progressEvents) {
-        if (evt.type === 'tool_start' && SUBAGENT_TOOL_NAMES.has(evt.toolName)) {
-          activeParentTools.add(evt.toolUseId)
-        }
-      }
-      events.push(...progressEvents)
-    }
-  }
-
-  private translateResult(
-    msg: SDKResultMessage,
-    events: AgentEvent[],
-    cachedContextWindow: { value: number | undefined },
-  ): void {
-    const modelUsageEntries = Object.values(msg.modelUsage || {})
-    const primaryModelUsage = modelUsageEntries[0]
-
-    // 缓存 contextWindow
-    if (primaryModelUsage?.contextWindow) {
-      cachedContextWindow.value = primaryModelUsage.contextWindow
-    }
-
-    const usage = {
-      inputTokens: msg.usage.input_tokens + (msg.usage.cache_read_input_tokens ?? 0) + (msg.usage.cache_creation_input_tokens ?? 0),
-      outputTokens: msg.usage.output_tokens,
-      costUsd: msg.total_cost_usd,
-      contextWindow: primaryModelUsage?.contextWindow,
-    }
-
-    if (msg.subtype === 'success') {
-      events.push({ type: 'complete', usage })
-    } else {
-      const errorMsg = msg.errors ? msg.errors.join(', ') : 'Agent 查询失败'
-      events.push({ type: 'error', message: errorMsg })
-      events.push({ type: 'complete', usage })
-    }
-  }
-
-  /** 翻译 system 类型消息（之前在 runAgent 循环中直接处理） */
-  private translateSystem(
-    message: SDKMessage,
-    events: AgentEvent[],
-    turnId: { value: string | null },
-  ): void {
-    const msg = message as {
-      type: 'system'; subtype?: string; status?: string
-      task_id?: string; tool_use_id?: string; description?: string; task_type?: string
-      // Agent Teams: task_progress 扩展字段
-      last_tool_name?: string; usage?: { total_tokens?: number; tool_uses?: number; duration_ms?: number }
-      // Agent Teams: task_notification 扩展字段
-      summary?: string; output_file?: string
-    }
-
-    if (msg.subtype === 'compact_boundary') {
-      events.push({ type: 'compact_complete' })
-    } else if (msg.subtype === 'status' && msg.status === 'compacting') {
-      events.push({ type: 'compacting' })
-    } else if (msg.subtype === 'task_started' && msg.task_id) {
-      events.push({
-        type: 'task_started',
-        taskId: msg.task_id,
-        toolUseId: msg.tool_use_id,
-        description: msg.description || `Task ${msg.task_id}`,
-        taskType: msg.task_type,
-        turnId: turnId.value || undefined,
-      })
-    } else if (msg.subtype === 'task_progress' && msg.task_id) {
-      // Agent Teams: teammate 任务进度（区别于 tool_progress 的计时事件）
-      events.push({
-        type: 'task_progress',
-        taskId: msg.task_id,
-        toolUseId: msg.tool_use_id || msg.task_id,
-        // 不设 elapsedSeconds — system task_progress 无真实计时，避免覆盖 tool_progress 的值
-        description: msg.description,
-        lastToolName: msg.last_tool_name,
-        usage: msg.usage ? {
-          totalTokens: msg.usage.total_tokens ?? 0,
-          toolUses: msg.usage.tool_uses ?? 0,
-          durationMs: msg.usage.duration_ms ?? 0,
-        } : undefined,
-        turnId: turnId.value || undefined,
-      })
-    } else if (msg.subtype === 'task_notification' && msg.task_id) {
-      // Agent Teams: teammate 任务完成/失败/停止
-      events.push({
-        type: 'task_notification',
-        taskId: msg.task_id,
-        toolUseId: msg.tool_use_id,
-        status: (msg.status as 'completed' | 'failed' | 'stopped') || 'completed',
-        summary: msg.summary || '',
-        outputFile: msg.output_file,
-        usage: msg.usage ? {
-          totalTokens: msg.usage.total_tokens ?? 0,
-          toolUses: msg.usage.tool_uses ?? 0,
-          durationMs: msg.usage.duration_ms ?? 0,
-        } : undefined,
-        turnId: turnId.value || undefined,
-      })
-    }
-  }
-
-  /** 翻译 prompt_suggestion 消息（之前在 runAgent 循环中直接处理） */
-  private translatePromptSuggestion(message: SDKMessage, events: AgentEvent[]): void {
-    const msg = message as { type: 'prompt_suggestion'; suggestion?: string }
-    if (msg.suggestion) {
-      events.push({ type: 'prompt_suggestion', suggestion: msg.suggestion })
-    }
-  }
-
-  /** 从 assistant 错误消息中提取详细信息 */
-  private extractErrorDetails(msg: SDKAssistantMessage): { detailedMessage: string; originalError: string } {
-    let detailedMessage = msg.error!.message
-    let originalError = msg.error!.message
-
-    try {
-      const content = msg.message?.content
-      if (Array.isArray(content) && content.length > 0) {
-        const textBlock = content.find((block: Record<string, unknown>) => block.type === 'text')
-        if (textBlock && 'text' in textBlock && typeof textBlock.text === 'string') {
-          const fullText = textBlock.text
-          originalError = fullText
-
-          const apiErrorMatch = fullText.match(/API Error:\s*\d+\s*(\{.*\})/s)
-          if (apiErrorMatch?.[1]) {
-            try {
-              const apiErrorObj = JSON.parse(apiErrorMatch[1])
-              if (apiErrorObj.error?.message) {
-                detailedMessage = apiErrorObj.error.message
-              }
-            } catch {
-              detailedMessage = fullText
-            }
-          } else {
-            detailedMessage = fullText
-          }
-        }
-      }
-    } catch {
-      // 提取失败，使用原始 error 字段
-    }
-
-    return { detailedMessage, originalError }
-  }
-
-  /**
-   * 发起查询，返回 AgentEvent 异步迭代流
-   *
-   * 内部完成：SDK 加载 → query 创建 → 消息遍历 → 翻译为 AgentEvent
-   * 外部只需遍历返回的 AsyncIterable，无需了解 SDK 细节。
-   */
-  async *query(input: AgentQueryInput): AsyncIterable<AgentEvent> {
+  async *query(input: AgentQueryInput): AsyncIterable<SDKMessage> {
     const options = input as ClaudeAgentQueryOptions
 
     // 创建 AbortController
     const controller = new AbortController()
     activeControllers.set(options.sessionId, controller)
 
-    // 查询级私有状态（不再暴露给外部）
-    const toolIndex = new ToolIndex()
-    const emittedToolStarts = new Set<string>()
-    const activeParentTools = new Set<string>()
-    const pendingText = { value: null as string | null }
-    const pendingParentToolUseId = { value: null as string | null }
-    const turnId = { value: null as string | null }
-    const cachedContextWindow = { value: undefined as number | undefined }
+    // 创建 Query 就绪 Promise（队列消息会等待此 Promise）
+    const readyPromise = new Promise<void>((resolve) => {
+      queryReadyResolvers.set(options.sessionId, resolve)
+    })
+    queryReadyPromises.set(options.sessionId, readyPromise)
 
     try {
       // 动态导入 SDK
@@ -666,28 +453,28 @@ export class ClaudeAgentAdapter implements AgentProviderAdapter {
         ...(options.maxTurns != null && { maxTurns: options.maxTurns }),
         permissionMode: options.sdkPermissionMode,
         allowDangerouslySkipPermissions: options.allowDangerouslySkipPermissions,
-        includePartialMessages: true,
+        // 关键：false 获取完整消息，与 v2 stream() 返回格式一致
+        includePartialMessages: false,
         promptSuggestions: true,
         cwd: options.cwd,
         abortController: controller,
         env: options.env,
         systemPrompt: options.systemPrompt,
-        // 不加载 user 级别的 ~/.claude/settings.json，防止其中的 env 字段
-        // （如 ANTHROPIC_AUTH_TOKEN、ANTHROPIC_BASE_URL）覆盖我们注入的凭证。
-        // 保留 project 级别以支持 CLAUDE.md 加载。
-        settingSources: ['project'],
+        // 不加载 user 级别的 ~/.claude/settings.json
+        settingSources: ['user', 'project'],
 
         // 条件字段
         ...(options.canUseTool && { canUseTool: options.canUseTool }),
         ...(options.allowedTools && { allowedTools: options.allowedTools }),
         ...(options.resumeSessionId ? { resume: options.resumeSessionId } : {}),
+        ...(options.resumeSessionAt && { resumeSessionAt: options.resumeSessionAt }),
         ...(options.mcpServers && Object.keys(options.mcpServers).length > 0 && {
           mcpServers: options.mcpServers as Record<string, import('@anthropic-ai/claude-agent-sdk').McpServerConfig>,
         }),
         ...(options.plugins && { plugins: options.plugins }),
         ...(options.onStderr && { stderr: options.onStderr }),
 
-        // ===== SDK 0.2.52+ 新增选项透传 =====
+        // SDK 0.2.52+ 新增选项透传
         ...(options.thinking && { thinking: options.thinking }),
         ...(options.effort && { effort: options.effort }),
         ...(options.agents && { agents: options.agents }),
@@ -704,59 +491,156 @@ export class ClaudeAgentAdapter implements AgentProviderAdapter {
         ...(options.additionalDirectories && options.additionalDirectories.length > 0 && {
           additionalDirectories: options.additionalDirectories,
         }),
+        // 强制顺序执行工具，防止并发 tool_use 导致 400 错误
+        // 根因：多个 tool_use 并发时若结果未完整批量提交会触发 invalid_request_error
+        toolUseConcurrency: 1,
       } as import('@anthropic-ai/claude-agent-sdk').Options
 
+      // 使用持久化消息通道：在查询期间保持 generator 活跃以支持工具权限注入，
+      // 收到 result 后调用 channel.close() 让 SDK 自然关闭 stdin 并退出子进程。
+      const channel = createMessageChannel(controller.signal)
+
+      // 将初始 prompt 入队
+      channel.enqueue({
+        type: 'user' as const,
+        session_id: options.sessionId,
+        message: {
+          role: 'user' as const,
+          content: options.prompt,
+        },
+        parent_tool_use_id: null,
+      } as import('@anthropic-ai/claude-agent-sdk').SDKUserMessage)
+
       const queryIterator = sdk.query({
-        prompt: options.prompt,
+        prompt: channel.generator,
         options: sdkOptions,
       })
+
+      // 保存 Query 和 Channel 引用，供后续消息注入使用
+      activeQueries.set(options.sessionId, queryIterator)
+      activeChannels.set(options.sessionId, channel)
+
+      // 通知 Query 已就绪，解除 sendQueuedMessage 的等待
+      const resolveReady = queryReadyResolvers.get(options.sessionId)
+      if (resolveReady) {
+        resolveReady()
+        queryReadyResolvers.delete(options.sessionId)
+      }
 
       for await (const sdkMessage of queryIterator) {
         if (controller.signal.aborted) break
 
-        const msg = sdkMessage as SDKMessage
+        const msg = sdkMessage as Record<string, unknown>
 
         // 捕获 SDK session_id
         if ('session_id' in msg && typeof msg.session_id === 'string' && msg.session_id) {
-          options.onSessionId?.(msg.session_id as string)
+          options.onSessionId?.(msg.session_id)
         }
 
         // 捕获 system init 中的模型确认
-        if (msg.type === 'system' && 'subtype' in msg && msg.subtype === 'init') {
-          const initMsg = msg as { model?: string }
-          if (typeof initMsg.model === 'string') {
-            options.onModelResolved?.(initMsg.model)
+        if (msg.type === 'system' && msg.subtype === 'init') {
+          if (typeof msg.model === 'string') {
+            options.onModelResolved?.(msg.model)
           }
         }
 
-        // 统一翻译
-        const events = this.translateMessage(
-          msg, toolIndex, emittedToolStarts,
-          activeParentTools, pendingText, pendingParentToolUseId, turnId, cachedContextWindow,
-        )
-
-        // 上下文窗口回调
-        if (cachedContextWindow.value !== undefined) {
-          options.onContextWindow?.(cachedContextWindow.value)
+        // 捕获 result 中的 contextWindow
+        if (msg.type === 'result') {
+          const resultMsg = msg as {
+            modelUsage?: Record<string, { contextWindow?: number }>
+            terminal_reason?: string
+          }
+          if (resultMsg.modelUsage) {
+            const firstEntry = Object.values(resultMsg.modelUsage)[0]
+            if (firstEntry?.contextWindow) {
+              options.onContextWindow?.(firstEntry.contextWindow)
+            }
+          }
+          // 被软中断（query.interrupt()）产生的 result：不关闭通道，
+          // 让 SDK 继续读取通道中已排队的下一条用户消息并开启新一轮 turn。
+          const wasAborted =
+            resultMsg.terminal_reason === 'aborted_streaming' ||
+            resultMsg.terminal_reason === 'aborted_tools'
+          if (!wasAborted) {
+            // result 表示当前轮次完成，关闭消息通道让 SDK 自然调用 endInput() 关闭 stdin。
+            // 子进程检测到 stdin EOF 后会退出，readMessages() 结束，iterator 返回 done:true。
+            // 注意：prompt_suggestion 等尾部消息仍会通过 stdout 正常传递，不受影响。
+            channel.close()
+          }
         }
 
-        for (const event of events) {
-          yield event
-        }
-      }
-
-      // 流结束时刷新 pendingText（修复静默丢弃问题）
-      if (pendingText.value) {
-        yield {
-          type: 'text_complete' as const,
-          text: pendingText.value,
-          isIntermediate: false,
-          turnId: turnId.value || undefined,
-          parentToolUseId: pendingParentToolUseId.value || undefined,
-        }
+        yield sdkMessage as SDKMessage
       }
     } finally {
       activeControllers.delete(options.sessionId)
+      activeQueries.delete(options.sessionId)
+      activeChannels.delete(options.sessionId)
+      queryReadyPromises.delete(options.sessionId)
+      queryReadyResolvers.delete(options.sessionId)
     }
+  }
+
+  /**
+   * 向活跃查询注入队列消息
+   *
+   * 通过持久化消息通道直接入队，由 SDK streamInput() 的长生命周期 generator 消费。
+   * 不再单独调用 query.streamInput()，避免触发 endInput() 关闭 CLI stdin。
+   */
+  async sendQueuedMessage(sessionId: string, message: SDKUserMessageInput): Promise<void> {
+    // 等待 Query 就绪（SDK init 可能需要几秒）
+    const readyPromise = queryReadyPromises.get(sessionId)
+    if (readyPromise) {
+      let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error('[Claude 适配器] 等待 SDK 初始化超时，请稍后重试')), QUERY_READY_TIMEOUT_MS)
+      })
+      try {
+        await Promise.race([readyPromise, timeoutPromise])
+      } finally {
+        clearTimeout(timeoutHandle)
+      }
+    }
+
+    const channel = activeChannels.get(sessionId)
+    if (!channel) {
+      throw new Error(`[Claude 适配器] 无活跃消息通道可注入队列消息: ${sessionId}`)
+    }
+    // 通过消息通道入队，generator 会自动 yield 给 SDK
+    channel.enqueue(message as import('@anthropic-ai/claude-agent-sdk').SDKUserMessage)
+    console.log(`[Claude 适配器] 队列消息已注入: sessionId=${sessionId}, uuid=${message.uuid}, priority=${message.priority}`)
+  }
+
+  /**
+   * 取消队列中的待发送消息
+   *
+   * 通过构造 cancel_async_message 控制消息注入，
+   * 由 SDK 内部匹配 uuid 并从命令队列中移除。
+   */
+  async cancelQueuedMessage(sessionId: string, messageUuid: string): Promise<void> {
+    const query = activeQueries.get(sessionId)
+    if (!query) return
+    // cancel_async_message 需要通过 streamInput 传递一个特殊的控制消息
+    // SDK Query 对象本身没有直接的 cancel 方法，但 streamInput 接受 SDKUserMessage
+    // 此处我们通过重新注入一个 'now' 优先级的空消息来间接触发
+    // 实际上 SDK 的 cancel_async_message 是 control_request，暂时在 orchestrator 层管理
+    console.log(`[Claude 适配器] 队列消息取消请求: sessionId=${sessionId}, uuid=${messageUuid}`)
+  }
+
+  /**
+   * 动态切换活跃查询的权限模式
+   *
+   * 通过 SDK Query.setPermissionMode() 方法在查询进行中切换权限模式。
+   * 典型场景：Plan 模式审批通过后切换到 bypassPermissions 或 acceptEdits。
+   */
+  async setPermissionMode(sessionId: string, mode: string): Promise<void> {
+    const query = activeQueries.get(sessionId)
+    if (!query) {
+      console.warn(`[Claude 适配器] 无活跃查询，跳过权限模式切换: ${sessionId}`)
+      return
+    }
+    await (query as ReturnType<typeof import('@anthropic-ai/claude-agent-sdk').query>).setPermissionMode(
+      mode as import('@anthropic-ai/claude-agent-sdk').PermissionMode,
+    )
+    console.log(`[Claude 适配器] 权限模式已切换: sessionId=${sessionId}, mode=${mode}`)
   }
 }

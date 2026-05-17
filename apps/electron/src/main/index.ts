@@ -1,6 +1,18 @@
 import { app, BrowserWindow, Menu, screen, shell } from 'electron'
 import { join } from 'path'
 import { existsSync } from 'fs'
+import { getSettings } from './lib/settings-service'
+
+// 处理 EPIPE 错误：当 stdout/stderr 管道被关闭时（如 electronmon 重启），忽略写入错误
+// 这在开发环境热重载时经常发生，不影响应用功能
+process.stdout?.on?.('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') return
+  throw err
+})
+process.stderr?.on?.('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EPIPE') return
+  throw err
+})
 
 // 清理本地环境中的 ANTHROPIC_* 变量，防止干扰应用的认证流程
 // Electron 桌面应用通过渠道系统管理 API Key，不应受终端环境变量影响
@@ -16,16 +28,61 @@ import { registerIpcHandlers } from './ipc'
 import { createTray, destroyTray } from './tray'
 import { initializeRuntime } from './lib/runtime-init'
 import { seedDefaultSkills } from './lib/config-paths'
+import { upgradeDefaultSkillsInWorkspaces } from './lib/agent-workspace-manager'
 import { stopAllAgents } from './lib/agent-service'
 import { stopAllGenerations } from './lib/chat-service'
 import { initAutoUpdater, cleanupUpdater } from './lib/updater/auto-updater'
 import { startWorkspaceWatcher, stopWorkspaceWatcher } from './lib/workspace-watcher'
 import { startChatToolsWatcher, stopChatToolsWatcher } from './lib/chat-tools-watcher'
-import { getIsQuitting, setQuitting } from './lib/app-lifecycle'
-import { feishuBridge } from './lib/feishu-bridge'
-import { getFeishuConfig } from './lib/feishu-config'
+import { getIsQuitting, setQuitting, getIsQuittingForUpdate } from './lib/app-lifecycle'
+import { registerBridge, startAllBridges, stopAllBridges } from './lib/bridge-registry'
+import { feishuBridgeManager } from './lib/feishu-bridge-manager'
+import { getFeishuMultiBotConfig } from './lib/feishu-config'
+import { dingtalkBridgeManager } from './lib/dingtalk-bridge-manager'
+import { getDingTalkMultiBotConfig } from './lib/dingtalk-config'
+import { wechatBridge } from './lib/wechat-bridge'
+import { getWeChatConfig } from './lib/wechat-config'
+import { createQuickTaskWindow, toggleQuickTaskWindow, destroyQuickTaskWindow } from './lib/quick-task-window'
+import { registerGlobalShortcut, unregisterAllGlobalShortcuts } from './lib/global-shortcut-service'
+
+// ===== Bridge 注册（新增 Bridge 只需在此添加一个 registerBridge 调用） =====
+
+registerBridge({
+  name: '飞书 BridgeManager',
+  shouldAutoStart: () => {
+    const config = getFeishuMultiBotConfig()
+    return config.bots.some((b) => b.enabled && b.appId && b.appSecret)
+  },
+  start: () => feishuBridgeManager.startAll(),
+  stop: () => feishuBridgeManager.stopAll(),
+})
+
+registerBridge({
+  name: '钉钉 BridgeManager',
+  shouldAutoStart: () => {
+    const config = getDingTalkMultiBotConfig()
+    return config.bots.some((b) => b.enabled && b.clientId && b.clientSecret)
+  },
+  start: () => dingtalkBridgeManager.startAll(),
+  stop: () => dingtalkBridgeManager.stopAll(),
+})
+
+registerBridge({
+  name: '微信 Bridge',
+  shouldAutoStart: () => {
+    const config = getWeChatConfig()
+    return !!(config.enabled && config.credentials)
+  },
+  start: () => wechatBridge.start(),
+  stop: () => wechatBridge.stop(),
+})
 
 let mainWindow: BrowserWindow | null = null
+
+/** 获取主窗口实例（供其他模块使用） */
+export function getMainWindow(): BrowserWindow | null {
+  return mainWindow
+}
 
 /**
  * 检查窗口是否在可用显示器范围内
@@ -148,6 +205,11 @@ function createWindow(): void {
   // 同时隐藏应用（类似 Cmd+H），确保点击 Dock 图标时 macOS 能正确触发 activate 事件
   if (process.platform === 'darwin') {
     mainWindow.on('close', (event) => {
+      // 更新安装退出：直接放行
+      if (getIsQuittingForUpdate()) {
+        return // 不阻止关闭
+      }
+      // 正常退出：检查是否正在退出
       if (!getIsQuitting()) {
         event.preventDefault()
         mainWindow?.hide()
@@ -169,6 +231,9 @@ app.whenReady().then(async () => {
   // 同步默认 Skills 模板到 ~/.proma/default-skills/
   seedDefaultSkills()
 
+  // 升级所有工作区中版本过旧的默认 Skills
+  upgradeDefaultSkillsInWorkspaces()
+
   // Create application menu
   const menu = createApplicationMenu()
   Menu.setApplicationMenu(menu)
@@ -177,9 +242,15 @@ app.whenReady().then(async () => {
   registerIpcHandlers()
 
   // Set dock icon on macOS (required for dev mode, bundled apps use Info.plist)
+  // 如果用户有保存的图标偏好则使用，否则用默认图标
   if (process.platform === 'darwin' && app.dock) {
-    const dockIconPath = join(__dirname, 'resources/icon.png')
-    if (existsSync(dockIconPath)) {
+    const { resolveAppIconPath } = require('./ipc')
+    const settings = getSettings()
+    const variantId = settings.appIconVariant
+    const dockIconPath = variantId
+      ? resolveAppIconPath(variantId)
+      : join(__dirname, 'resources/icon.png')
+    if (dockIconPath && existsSync(dockIconPath)) {
       app.dock.setIcon(dockIconPath)
     }
   }
@@ -198,18 +269,21 @@ app.whenReady().then(async () => {
   // 启动 Chat 工具配置文件监听（Agent 创建工具后自动通知渲染进程）
   startChatToolsWatcher()
 
-  // 生产环境下初始化自动更新
-  if (app.isPackaged && mainWindow) {
+  // 初始化自动更新（生产环境 + 开发测试模式）
+  // 开发模式下使用 forceDevUpdateConfig 进行本地更新测试
+  if (mainWindow) {
     initAutoUpdater(mainWindow)
   }
 
-  // 飞书 Bridge 自动启动（配置启用时）
-  const feishuConfig = getFeishuConfig()
-  if (feishuConfig.enabled && feishuConfig.appId && feishuConfig.appSecret) {
-    feishuBridge.start().catch((err) => {
-      console.error('[飞书 Bridge] 自动启动失败:', err)
-    })
-  }
+  // 预创建快速任务窗口（隐藏状态，首次唤起秒开）
+  createQuickTaskWindow()
+
+  // 注册全局快捷键
+  registerGlobalShortcut('quick-task', toggleQuickTaskWindow)
+  registerGlobalShortcut('show-main-window', showAndFocusMainWindow)
+
+  // 启动所有已注册的 Bridge（飞书/钉钉/微信等）
+  await startAllBridges()
 
   app.on('activate', () => {
     // 直接检查 mainWindow 引用，避免 getAllWindows() 包含 DevTools 等其他窗口导致误判
@@ -243,8 +317,12 @@ app.on('before-quit', () => {
   stopWorkspaceWatcher()
   // 停止 Chat 工具配置文件监听
   stopChatToolsWatcher()
-  // 停止飞书 Bridge
-  feishuBridge.stop()
+  // 停止所有 Bridge
+  stopAllBridges()
+  // 注销全局快捷键
+  unregisterAllGlobalShortcuts()
+  // 销毁快速任务窗口
+  destroyQuickTaskWindow()
   // Clean up system tray before quitting
   destroyTray()
 })
